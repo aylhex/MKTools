@@ -57,7 +57,9 @@ export async function getDevices(): Promise<Device[]> {
              const ideviceIdPath = getIosToolPath('idevice_id');
              const ideviceInfoPath = getIosToolPath('ideviceinfo');
              
-             const env = getIosEnv(ideviceIdPath); // 获取通用环境配置
+             // 此时 getIosToolPath 已经根据架构返回了正确的二进制路径 (mac-arm64 或 mac-x64)
+             // 我们只需要设置正确的环境变量（主要是动态库加载路径）
+             const env = getIosEnv(ideviceIdPath); 
              
              // 如果找不到工具，execPromise 会抛出错误，直接跳过
              if (!ideviceIdPath) {

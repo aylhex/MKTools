@@ -4,7 +4,7 @@ import { BrowserWindow } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
-import { getAdbPath } from '../utils/paths';
+import { getAdbPath, getIosToolPath } from '../utils/paths';
 import { execSshCommand, uploadSshFile, checkJailbreak } from './iosSshService';
 import { saveIconsBatch, getIconsBatch } from './iconCacheService';
 
@@ -1110,35 +1110,58 @@ async function decryptIosApp(
     }
     onLog('[iOS] ✓ SSH 连接已建立');
     
-    // 检查应用是否正在运行，如果是则杀死它
+    // 检查应用是否正在运行
     onLog('[iOS] 检查目标应用状态...');
+    let isRunning = false;
     try {
       const psOutput = await execSshCommand(deviceId, `ps -A | grep -i "${bundleId}" | grep -v grep`);
       if (psOutput && psOutput.trim()) {
-        onLog('[iOS] 应用正在运行，准备重启...');
-        // 提取 PID 并杀死进程
-        const lines = psOutput.trim().split('\n');
-        for (const line of lines) {
-          const match = line.trim().match(/^\s*(\d+)/);
-          if (match && match[1]) {
-            const pid = match[1];
-            onLog(`[iOS] 杀死进程 PID: ${pid}`);
-            try {
-              await execSshCommand(deviceId, `kill -9 ${pid}`);
-            } catch (e) {
-              // 忽略杀死进程的错误
-            }
-          }
-        }
-        // 等待进程完全退出
-        await new Promise(r => setTimeout(r, 2000));
-        onLog('[iOS] ✓ 应用已停止');
+        onLog('[iOS] 应用正在运行，准备直接附加...');
+        isRunning = true;
       } else {
         onLog('[iOS] 应用未运行');
       }
     } catch (e) {
       // 如果 grep 没找到进程，会返回错误，这是正常的
       onLog('[iOS] 应用未运行');
+    }
+
+    // 如果应用未运行，尝试通过 SSH 启动
+    if (!isRunning) {
+      onLog('[iOS] 尝试通过 SSH 启动应用...');
+      
+      const launchCommands = [
+        `open ${bundleId}`,
+        `/usr/bin/open ${bundleId}`,
+        `uiopen ${bundleId}`,
+        `/usr/bin/uiopen ${bundleId}`
+      ];
+
+      let launchSuccess = false;
+      
+      for (const cmd of launchCommands) {
+        try {
+          onLog(`[iOS Debug] 尝试启动命令: ${cmd}`);
+          await execSshCommand(deviceId, cmd);
+          // 等待应用启动
+          await new Promise(r => setTimeout(r, 3000));
+          
+          // 检查是否成功启动
+          const psOutput = await execSshCommand(deviceId, `ps -A | grep -i "${bundleId}" | grep -v grep`);
+          if (psOutput && psOutput.trim()) {
+            onLog('[iOS] 应用已通过 SSH 启动');
+            launchSuccess = true;
+            break;
+          }
+        } catch (e) {
+          // 忽略单个命令的失败
+        }
+      }
+
+      if (!launchSuccess) {
+        onLog('[iOS Warn] SSH 启动应用失败，将尝试由 dump.py 启动 (可能会因签名问题失败)...');
+        onLog('[iOS] 建议手动在设备上打开目标应用，然后重试');
+      }
     }
   } catch (e: any) {
     onLog(`[iOS Error] SSH 连接失败: ${e.message}`);
@@ -1262,11 +1285,11 @@ async function decryptIosApp(
         }
       });
       
-      // 超时 10 分钟（大型应用需要更长时间）
+      // 超时 20 分钟（大型应用需要更长时间）
       setTimeout(() => {
         child.kill();
-        reject(new Error('Decryption timeout (10 minutes)'));
-      }, 10 * 60 * 1000);
+        reject(new Error('Decryption timeout (20 minutes)'));
+      }, 20 * 60 * 1000);
     });
   } catch (e: any) {
     onLog(`[Error] iOS 脱壳失败: ${e.message}`);
@@ -1281,66 +1304,66 @@ export async function extractIosHeaders(
 ): Promise<string> {
   onLog('[Header] 开始提取 header 文件...');
   
-  // 获取 dsdump 工具路径
-  const getDsdumpPath = (): string => {
+  // 获取 ipsw 工具路径
+  const getIpswPath = (): string => {
+    const toolPath = getIosToolPath('ipsw');
+    if (toolPath) return toolPath;
+
+    // Fallback for error reporting
+    const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
     if (process.resourcesPath) {
-      const packagedPath = path.join(process.resourcesPath, 'bin', 'mac', 'dsdump');
-      if (fs.existsSync(packagedPath)) return packagedPath;
+      return path.join(process.resourcesPath, 'bin', arch, 'ipsw');
     }
-    return path.join(process.cwd(), 'resources', 'bin', 'mac', 'dsdump');
+    return path.join(process.cwd(), 'resources', 'bin', arch, 'ipsw');
   };
   
-  const dsdumpPath = getDsdumpPath();
+  const ipswPath = getIpswPath();
   
-  if (!fs.existsSync(dsdumpPath)) {
-    onLog(`[Header Error] dsdump 工具未找到: ${dsdumpPath}`);
-    throw new Error('dsdump tool not found');
+  if (!fs.existsSync(ipswPath)) {
+    onLog(`[Header Error] ipsw 工具未找到: ${ipswPath}`);
+    throw new Error('ipsw tool not found');
   }
   
-  onLog(`[Header] ✓ 找到 dsdump 工具: ${dsdumpPath}`);
+  onLog(`[Header] ✓ 找到 ipsw 工具: ${ipswPath}`);
   
-  // 确保 dsdump 有执行权限
+  // 确保 ipsw 有执行权限
   try {
-    await execPromise(`chmod +x "${dsdumpPath}"`);
+    await execPromise(`chmod +x "${ipswPath}"`);
   } catch (e) {
     // 忽略权限设置错误
   }
   
   // 检查架构兼容性
   try {
-    const { stdout: archCheck } = await execPromise(`file "${dsdumpPath}"`);
+    const { stdout: archCheck } = await execPromise(`file "${ipswPath}"`);
     const { stdout: systemArch } = await execPromise('uname -m');
     
     onLog(`[Header] 系统架构: ${systemArch.trim()}`);
     
-    // 检查是否是 Universal Binary
     const hasX86 = archCheck.includes('x86_64');
     const hasArm = archCheck.includes('arm64');
     
     if (hasX86 && hasArm) {
-      onLog('[Header] dsdump 架构: Universal Binary (x86_64 + arm64)');
+      onLog('[Header] ipsw 架构: Universal Binary (x86_64 + arm64)');
       onLog('[Header] ✓ 支持当前系统架构，将原生运行');
     } else if (hasArm) {
-      onLog('[Header] dsdump 架构: arm64 (Apple Silicon)');
+      onLog('[Header] ipsw 架构: arm64 (Apple Silicon)');
     } else if (hasX86) {
-      onLog('[Header] dsdump 架构: x86_64 (Intel)');
+      onLog('[Header] ipsw 架构: x86_64 (Intel)');
       
-      // 如果是 Apple Silicon 但 dsdump 只有 x86_64，需要 Rosetta
+      // 如果是 Apple Silicon 但 ipsw 只有 x86_64，需要 Rosetta
       if (systemArch.trim() === 'arm64') {
-        onLog('[Header] 检测到架构不匹配，需要 Rosetta 2 支持');
+        onLog('[Header] 检测到架构不匹配，将通过 Rosetta 2 运行');
         
         // 检查 Rosetta 是否可用
         try {
           await execPromise('arch -x86_64 /usr/bin/true');
-          onLog('[Header] ✓ Rosetta 2 可用，将使用兼容模式运行');
+          onLog('[Header] ✓ Rosetta 2 可用');
         } catch (e) {
           onLog('[Header Error] Rosetta 2 未安装或不可用');
-          onLog('[Header Error] 请安装 Rosetta 2: softwareupdate --install-rosetta');
-          throw new Error('dsdump requires Rosetta 2 on Apple Silicon. Install with: softwareupdate --install-rosetta');
+          throw new Error('ipsw requires Rosetta 2 on Apple Silicon. Install with: softwareupdate --install-rosetta');
         }
       }
-    } else {
-      onLog('[Header] dsdump 架构: 未知');
     }
   } catch (e: any) {
     onLog(`[Header Warn] 架构检查失败: ${e.message}`);
@@ -1384,79 +1407,67 @@ export async function extractIosHeaders(
     fs.mkdirSync(headersDir, { recursive: true });
     onLog(`[Header] Headers 输出目录: ${headersDir}`);
     
-    // 运行 dsdump
-    // 使用 Python 脚本来调用 dsdump，它会将输出分割成单独的文件
-    onLog('[Header] 运行 dsdump...');
-    
-    const outputDir = headersDir; // 输出目录
-    
-    // 获取 Python 脚本路径
-    const getDsdumpPyPath = (): string => {
-      if (process.resourcesPath) {
-        const packagedPath = path.join(process.resourcesPath, 'bin', 'mac', 'dsdump.py');
-        if (fs.existsSync(packagedPath)) return packagedPath;
-      }
-      return path.join(process.cwd(), 'resources', 'bin', 'mac', 'dsdump.py');
-    };
-    
-    const dsdumpPyPath = getDsdumpPyPath();
-    
-    if (!fs.existsSync(dsdumpPyPath)) {
-      onLog(`[Header Error] dsdump.py 脚本未找到: ${dsdumpPyPath}`);
-      throw new Error('dsdump.py script not found');
-    }
-    
-    // 检测可用的 Python 命令
-    let pythonCmd = 'python3';
-    try {
-      await execPromise('python3 --version');
-    } catch (e) {
-      try {
-        await execPromise('python --version');
-        pythonCmd = 'python';
-      } catch (e2) {
-        onLog('[Header Error] Python 未找到');
-        throw new Error('Python not found');
-      }
-    }
-    
-    onLog(`[Header] 使用 ${pythonCmd} 执行 dsdump.py`);
-    onLog('[Header] 提取中（可能需要几分钟）...');
+    // 运行 ipsw
+    onLog('[Header] 运行 ipsw class-dump...');
+    onLog('[Header] 提示：对于大型应用（如微信、QQ等），此过程可能需要较长时间（10-30分钟），请耐心等待...');
     
     try {
-      // 使用 Python 脚本调用 dsdump
-      // -i: 输入文件（二进制）
-      // -o: 输出目录
-      // -a: 架构（arm64 或 armv7）
-      // -d: demangle Swift 符号
+      // ipsw class-dump <binary> --headers -o <output>
+      // 注意: ipsw 可能会在 output 目录下再创建一层目录，我们需要检查一下
+      // 设置超时为 20 分钟 (1200000 ms)，maxBuffer 为 2GB
       const { stdout, stderr } = await execPromise(
-        `${pythonCmd} "${dsdumpPyPath}" -i "${binaryPath}" -o "${outputDir}" -a arm64 -d`,
-        { timeout: 180000, maxBuffer: 50 * 1024 * 1024 } // 3分钟超时
+        `"${ipswPath}" class-dump "${binaryPath}" --headers -o "${headersDir}"`,
+        { timeout: 1200000, maxBuffer: 2 * 1024 * 1024 * 1024 }
       );
       
-      // 显示输出（文件列表）
-      if (stdout) {
-        const lines = stdout.trim().split('\n');
-        const fileCount = lines.filter(l => l.includes('.h') || l.includes('.swift')).length;
-        onLog(`[Header] ✓ 成功提取 ${fileCount} 个文件`);
-        
-        // 统计文件类型
-        const hFiles = lines.filter(l => l.endsWith('.h')).length;
-        const swiftFiles = lines.filter(l => l.endsWith('.swift')).length;
-        
-        onLog(`[Header]   - Objective-C 头文件: ${hFiles}`);
-        onLog(`[Header]   - Swift 文件: ${swiftFiles}`);
-      }
+      onLog('[Header] ✓ ipsw 执行完成');
+      if (stdout && stdout.length > 0) onLog(`[Header Info] ${stdout.substring(0, 200)}...`);
       
-      if (stderr && !stderr.includes('SyntaxWarning')) {
-        onLog(`[Header Debug] stderr: ${stderr.substring(0, 500)}`);
+      // 提取 Entitlements (权限信息)
+      onLog('[Header] 正在提取应用权限 (Entitlements)...');
+      try {
+        const entPath = path.join(headersDir, 'Entitlements.txt');
+        // ipsw macho info <binary> -e
+        const { stdout: entOutput } = await execPromise(
+          `"${ipswPath}" macho info "${binaryPath}" -e`,
+          { timeout: 60000 }
+        );
+        
+        if (entOutput && entOutput.trim().length > 0) {
+          fs.writeFileSync(entPath, entOutput);
+          onLog(`[Header] ✓ 权限信息已保存: ${entPath}`);
+        } else {
+          onLog('[Header Warn] 未提取到权限信息或输出为空');
+        }
+      } catch (e: any) {
+        onLog(`[Header Warn] 提取权限信息失败: ${e.message}`);
+        // 不中断流程，继续生成摘要
       }
       
       // 生成摘要文件
-      const summaryFile = path.join(outputDir, 'README.txt');
-      const fileList = fs.readdirSync(outputDir);
-      const hFiles = fileList.filter(f => f.endsWith('.h'));
-      const swiftFiles = fileList.filter(f => f.endsWith('.swift'));
+      const summaryFile = path.join(headersDir, 'README.txt');
+      
+      // 统计文件 (递归查找，因为 ipsw 可能会创建子目录)
+      const countFiles = (dir: string): { h: number, total: number } => {
+        let h = 0;
+        let t = 0;
+        if (!fs.existsSync(dir)) return { h: 0, total: 0 };
+        
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            const sub = countFiles(path.join(dir, entry.name));
+            h += sub.h;
+            t += sub.total;
+          } else {
+            t++;
+            if (entry.name.endsWith('.h')) h++;
+          }
+        }
+        return { h, total: t };
+      };
+      
+      const stats = countFiles(headersDir);
       
       const summary = `
 Header Extraction Summary
@@ -1466,39 +1477,23 @@ Date: ${new Date().toISOString()}
 IPA: ${path.basename(ipaPath)}
 
 Statistics:
-- Objective-C Header Files: ${hFiles.length}
-- Swift Files: ${swiftFiles.length}
-- Total Files: ${fileList.length - 1}
+- Objective-C Header Files: ${stats.h}
+- Total Files: ${stats.total}
 
 Output Directory:
-${outputDir}
+${headersDir}
 
-Generated by dsdump.py (Version 2.0)
-
-Note: Each class/protocol has been extracted to a separate file for easier browsing.
+Generated by ipsw
 `;
       fs.writeFileSync(summaryFile, summary);
       onLog(`[Header] ✓ 摘要文件: ${summaryFile}`);
+      onLog(`[Header] 统计: ${stats.h} 个头文件，共 ${stats.total} 个文件`);
       
-    } catch (dsdumpError: any) {
-      // 显示详细的错误信息
-      onLog(`[Header Error] dsdump.py 执行失败或超时`);
-      
-      // 检查是否是超时错误
-      if (dsdumpError.killed || dsdumpError.signal === 'SIGTERM') {
-        onLog(`[Header Error] dsdump.py 执行超时（3分钟）`);
-        onLog(`[Header] 该二进制文件可能太大或太复杂`);
-      }
-      
-      if (dsdumpError.stdout) {
-        onLog(`[Header Debug] stdout: ${dsdumpError.stdout.substring(0, 1000)}`);
-      }
-      if (dsdumpError.stderr) {
-        onLog(`[Header Error] stderr: ${dsdumpError.stderr.substring(0, 1000)}`);
-      }
-      onLog(`[Header Error] 错误信息: ${dsdumpError.message}`);
-      
-      throw dsdumpError;
+    } catch (ipswError: any) {
+      onLog(`[Header Error] ipsw 执行失败或超时`);
+      if (ipswError.stdout) onLog(`[Header Debug] stdout: ${ipswError.stdout.substring(0, 500)}`);
+      if (ipswError.stderr) onLog(`[Header Error] stderr: ${ipswError.stderr.substring(0, 500)}`);
+      throw ipswError;
     }
     
     // 清理临时目录

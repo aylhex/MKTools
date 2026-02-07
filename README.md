@@ -48,12 +48,21 @@ MKTools 是一款移动端应用分析与工具箱(目前仅适配了Mac系统)�
 - **Backend**: Electron
 - **Tools**: Frida, ADB, Apktool, libimobiledevice
 
+## 🏗️ 架构说明
+
+本项目采用了多架构二进制打包策略，以确保在 Intel Mac (x64) 和 Apple Silicon Mac (arm64) 上均能原生运行，无需 Rosetta 转译（dsdump 等工具除外，已内置 Universal Binary 或自动适配）。
+
+- **resources/bin/mac-arm64**: 存放 Apple Silicon 架构的原生工具 (adb, libimobiledevice 等)。
+- **resources/bin/mac-x64**: 存放 Intel 架构的原生工具。
+- **动态调用**: 程序启动时会自动识别系统架构 (`process.arch`) 并调用对应的工具目录。
+
 ## 🚀 快速开始
 
 ### 环境要求
 - Node.js (建议 v18+)
 - npm 或 yarn
 - Python 3 (用于 Frida 脚本)
+- Frida (Frida 版本16.2.1)
 - Java (用于 Apktool 等工具)
 
 ### 安装依赖
@@ -96,6 +105,5 @@ npm run build
 - **iOS 功能**: 部分 iOS 功能（如砸壳）需要设备越狱并安装 Frida Server。
 - **Android 功能**: 请确保已开启 USB 调试模式，砸壳功能建议在 Root 设备上使用以获得最佳兼容性。
 
-## 📄 许可证
 
 本项目仅供学习和研究使用。

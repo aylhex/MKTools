@@ -1,6 +1,8 @@
 {
   "name": "mktools",
   "productName": "MKTools",
+  "description": "Mobile Analysis Tool for Android and iOS",
+  "author": "MKTools",
   "private": true,
   "version": "1.0.0",
   "main": "dist-electron/main.js",
@@ -54,8 +56,15 @@
       "category": "public.app-category.developer-tools",
       "extraResources": [
         {
-          "from": "resources/bin/mac",
-          "to": "bin/mac",
+          "from": "resources/bin/mac-arm64",
+          "to": "bin/mac-arm64",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "resources/bin/mac-x64",
+          "to": "bin/mac-x64",
           "filter": [
             "**/*"
           ]

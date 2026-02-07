@@ -65,10 +65,38 @@ function createWindow() {
     height: 800,
     title: 'MKTools',
     icon: process.env.VITE_PUBLIC ? path.join(process.env.VITE_PUBLIC, 'icon.png') : undefined,
+    show: false, // 先隐藏窗口，等待内容加载完成
+    backgroundColor: '#09090b', // 设置默认背景色为 zinc-950 (深色模式默认值)，避免白色闪烁
+    opacity: 0, // 初始透明度为0，用于实现淡入动画
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
   })
+
+  // 当页面准备好显示时再显示窗口，并执行淡入动画
+  win.once('ready-to-show', () => {
+    if (!win) return;
+    win.show();
+    
+    // 淡入动画
+    let opacity = 0;
+    const step = 0.05; // 每次增加的透明度
+    const interval = 10; // 间隔时间(ms)
+    
+    const fadeTimer = setInterval(() => {
+      if (!win || win.isDestroyed()) {
+        clearInterval(fadeTimer);
+        return;
+      }
+      
+      opacity += step;
+      if (opacity >= 1) {
+        opacity = 1;
+        clearInterval(fadeTimer);
+      }
+      win.setOpacity(opacity);
+    }, interval);
+  });
 
   // Test active push message to Renderer-process.
   win.webContents.on('did-finish-load', () => {

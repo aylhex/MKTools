@@ -25,7 +25,8 @@ export function getAdbPath(): string {
   if (platform === 'win32') {
       builtInPath = path.join(process.resourcesPath, 'bin', 'win', 'adb.exe');
   } else if (platform === 'darwin') {
-      builtInPath = path.join(process.resourcesPath, 'bin', 'mac', 'adb');
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(process.resourcesPath, 'bin', arch, 'adb');
   } else {
       builtInPath = path.join(process.resourcesPath, 'bin', 'linux', 'adb');
   }
@@ -38,7 +39,8 @@ export function getAdbPath(): string {
   if (platform === 'win32') {
       builtInPath = path.join(process.cwd(), 'resources', 'bin', 'win', 'adb.exe');
   } else if (platform === 'darwin') {
-      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'mac', 'adb');
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(process.cwd(), 'resources', 'bin', arch, 'adb');
   } else {
       builtInPath = path.join(process.cwd(), 'resources', 'bin', 'linux', 'adb');
   }
@@ -52,7 +54,8 @@ export function getAdbPath(): string {
   if (platform === 'win32') {
       builtInPath = path.join(rootDir, 'resources', 'bin', 'win', 'adb.exe');
   } else if (platform === 'darwin') {
-      builtInPath = path.join(rootDir, 'resources', 'bin', 'mac', 'adb');
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(rootDir, 'resources', 'bin', arch, 'adb');
   } else {
       builtInPath = path.join(rootDir, 'resources', 'bin', 'linux', 'adb');
   }
@@ -114,45 +117,61 @@ export function getAdbPath(): string {
 export function getIosToolPath(toolName: string): string {
   const platform = process.platform;
   
-  // Windows 下添加 .exe 后缀
-  const fileName = platform === 'win32' ? `${toolName}.exe` : toolName;
-
   // 0. 优先查找内置工具 (resources/bin)
   // 策略1: 标准 Packaged 路径
   let builtInPath = '';
   if (platform === 'win32') {
-      builtInPath = path.join(process.resourcesPath, 'bin', 'win', fileName);
+      builtInPath = path.join(process.resourcesPath, 'bin', 'win', toolName + '.exe');
   } else if (platform === 'darwin') {
-      builtInPath = path.join(process.resourcesPath, 'bin', 'mac', fileName);
+      // 区分架构选择路径
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(process.resourcesPath, 'bin', arch, toolName);
+      
+      // 兼容旧路径: 如果新架构目录不存在，尝试回退到旧的 mac 目录
+      if (!fs.existsSync(builtInPath)) {
+          builtInPath = path.join(process.resourcesPath, 'bin', 'mac', toolName);
+      }
   } else {
-      builtInPath = path.join(process.resourcesPath, 'bin', 'linux', fileName);
-  }
-
-  if (fs.existsSync(builtInPath)) {
-    return builtInPath;
-  }
-
-  // 策略2: 开发环境 CWD 路径
-  if (platform === 'win32') {
-      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'win', fileName);
-  } else if (platform === 'darwin') {
-      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'mac', fileName);
-  } else {
-      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'linux', fileName);
+      builtInPath = path.join(process.resourcesPath, 'bin', 'linux', toolName);
   }
 
   if (fs.existsSync(builtInPath)) {
       return builtInPath;
   }
 
-  // 策略3: 开发环境 __dirname 推断
+  // 策略2: 尝试开发环境路径 (CWD)
+  if (platform === 'win32') {
+      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'win', toolName + '.exe');
+  } else if (platform === 'darwin') {
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(process.cwd(), 'resources', 'bin', arch, toolName);
+
+      // 兼容旧路径
+      if (!fs.existsSync(builtInPath)) {
+        builtInPath = path.join(process.cwd(), 'resources', 'bin', 'mac', toolName);
+      }
+  } else {
+      builtInPath = path.join(process.cwd(), 'resources', 'bin', 'linux', toolName);
+  }
+
+  if (fs.existsSync(builtInPath)) {
+      return builtInPath;
+  }
+
+  // 策略3: 尝试从 __dirname 推断
   const rootDir = path.resolve(__dirname, '..');
   if (platform === 'win32') {
-      builtInPath = path.join(rootDir, 'resources', 'bin', 'win', fileName);
+      builtInPath = path.join(rootDir, 'resources', 'bin', 'win', toolName + '.exe');
   } else if (platform === 'darwin') {
-      builtInPath = path.join(rootDir, 'resources', 'bin', 'mac', fileName);
+      const arch = process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+      builtInPath = path.join(rootDir, 'resources', 'bin', arch, toolName);
+      
+      // 兼容旧路径
+      if (!fs.existsSync(builtInPath)) {
+        builtInPath = path.join(rootDir, 'resources', 'bin', 'mac', toolName);
+      }
   } else {
-      builtInPath = path.join(rootDir, 'resources', 'bin', 'linux', fileName);
+      builtInPath = path.join(rootDir, 'resources', 'bin', 'linux', toolName);
   }
 
   if (fs.existsSync(builtInPath)) {
