@@ -37,7 +37,7 @@ MKTools 是一款移动端应用分析工具箱(目前仅适配了Mac系统)。�
 - **基于 Frida**: 内置 Frida 引擎，安全高效。
 - **一键脱壳**:
   - **Android**: 基于 `frida-dexdump`，支持从内存中 dump dex 文件。
-  - **iOS**: 基于 `frida-ios-dump`，支持一键砸壳并导出无加密 IPA。
+  - **iOS**: 基于 `frida-ios-dump`，支持一键砸壳并导出IPA文件。
 - **应用列表**: 自动加载设备内已安装应用列表（带图标），方便选择目标应用。
 
 <img src="docs/images/应用脱壳.png" width="800" alt="应用脱壳界面" />
@@ -50,7 +50,7 @@ MKTools 是一款移动端应用分析工具箱(目前仅适配了Mac系统)。�
 
 ## 🏗️ 架构说明
 
-本项目采用了多架构二进制打包策略，以确保在 Intel Mac (x64) 和 Apple Silicon Mac (arm64) 上均能原生运行，无需 Rosetta 转译（dsdump 等工具除外，已内置 Universal Binary 或自动适配）。
+本项目采用了多架构二进制打包策略，以确保在 Intel Mac (x64) 和 Apple Silicon Mac (arm64) 上均能原生运行。
 
 - **resources/bin/mac-arm64**: 存放 Apple Silicon 架构的原生工具 (adb, libimobiledevice 等)。
 - **resources/bin/mac-x64**: 存放 Intel 架构的原生工具。
@@ -78,22 +78,22 @@ npm install
 npm run dev
 ```
 
-macOS 开发模式（修复应用名称显示）：
+macOS 开发模式：
 ```bash
 npm run dev:mac
 ```
 
-### 构建安装包
+### 编译安装包
 
 ```bash
 npm run build
 ```
 
-构建产物将位于 `dist_build` 目录中。
+编译结果在 `dist_build` 目录中。
 
 ## 📖 文档与资源
 
-本项目包含详细的 Frida 使用指南，位于 `docs/` 目录下：
+详细的 Frida 使用指南，位于 `docs/` 目录下：
 
 - [Frida 脱壳指南](docs/FRIDA_DECRYPT.md)
 - [Frida 示例脚本](docs/FRIDA_EXAMPLES.md)
@@ -103,7 +103,7 @@ npm run build
 ## ⚠️ 注意事项
 
 - **iOS 功能**: 部分 iOS 功能（如砸壳）需要设备越狱并安装 Frida Server。
-- **Android 功能**: 请确保已开启 USB 调试模式，砸壳功能建议在 Root 设备上使用以获得最佳兼容性。
+- **Android 功能**: 请确保已开启 USB 调试模式，砸壳功能需要在 Root 设备上使用。
 
 
 本项目仅供学习和研究使用。

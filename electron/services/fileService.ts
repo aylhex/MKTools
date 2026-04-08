@@ -434,7 +434,19 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
     // 首先检查目标路径是否是符号链接，如果是则解析到最终路径
     let actualDir = dir;
     try {
-      const { stdout: resolvedOut } = await execPromise(`"${adb}" -s "${deviceId}" shell "readlink -f '${dir}' 2>/dev/null"`);
+      let resolvedOut: string;
+      try {
+        const r = await execPromise(`"${adb}" -s "${deviceId}" shell "readlink -f '${dir}' 2>/dev/null"`);
+        resolvedOut = r.stdout;
+      } catch {
+        // 尝试用 su 提权
+        try {
+          const r = await execPromise(`"${adb}" -s "${deviceId}" shell 'su -c "readlink -f ${dir} 2>/dev/null"'`);
+          resolvedOut = r.stdout;
+        } catch {
+          resolvedOut = '';
+        }
+      }
       const resolved = resolvedOut.trim();
       if (resolved && resolved.startsWith('/') && resolved !== dir) {
         actualDir = resolved;
@@ -443,7 +455,57 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
       // readlink -f 不可用或路径不是符号链接，使用原路径
     }
     
-    const { stdout } = await execPromise(`"${adb}" -s "${deviceId}" shell ls -la "${actualDir}"`);
+    let stdout: string;
+    try {
+      const result = await execPromise(`"${adb}" -s "${deviceId}" shell ls -la "${actualDir}"`);
+      stdout = result.stdout;
+    } catch (err: any) {
+      // ls 以非零退出码退出，但 stdout 可能仍有部分内容（如 /proc 下损坏的符号链接）
+      if (err.stdout && err.stdout.trim().length > 0) {
+        stdout = err.stdout;
+      } else if (err.stderr?.includes('Permission denied') || err.stdout?.includes('Permission denied') || err.message?.includes('Permission denied')) {
+        // 尝试用 su 提权重试，依次尝试多种语法
+        let rootStdout: string | null = null;
+        const suAttempts = [
+          // 方式1: su 0 不用 -c，直接跟命令（部分实现支持）
+          `"${adb}" -s "${deviceId}" shell su 0 ls -la "${actualDir}"`,
+          // 方式2: 单引号包裹整个远端命令，保证 -c 拿到完整参数
+          `"${adb}" -s "${deviceId}" shell 'su -c "ls -la ${actualDir}"'`,
+          // 方式3: adb root 重启 adbd（仅限 debug 版系统）
+          null,
+        ];
+
+        for (const cmd of suAttempts) {
+          if (cmd === null) {
+            // 尝试 adb root
+            try {
+              await execPromise(`"${adb}" -s "${deviceId}" root`);
+              await new Promise(r => setTimeout(r, 1500));
+              const r = await execPromise(`"${adb}" -s "${deviceId}" shell ls -la "${actualDir}"`);
+              rootStdout = r.stdout;
+              break;
+            } catch { continue; }
+          }
+          try {
+            const r = await execPromise(cmd);
+            // 确认输出不是权限错误
+            if (!r.stdout.includes('Permission denied')) {
+              rootStdout = r.stdout;
+              break;
+            }
+          } catch (e: any) {
+            console.error(`[fs-list] su attempt failed: ${cmd}\n  stdout: ${e.stdout}\n  stderr: ${e.stderr}\n  msg: ${e.message}`);
+          }
+        }
+
+        if (rootStdout === null) {
+          throw new Error(`Permission denied: 无权限访问目录 "${actualDir}"`);
+        }
+        stdout = rootStdout;
+      } else {
+        throw err;
+      }
+    }
     const lines = stdout.split('\n');
     const out: FileEntry[] = [];
     

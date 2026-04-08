@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Theme, SignResult, Device } from '../types';
-import { Shield, Smartphone, Apple, FileUp, Key, Activity, Loader2, CheckCircle2, XCircle, X, Download } from 'lucide-react';
+import { Shield, Smartphone, Apple, FileUp, Key, Activity, Loader2, CheckCircle2, XCircle, X, Download, FolderOpen, Play } from 'lucide-react';
 
 interface AppSignerProps {
   theme: Theme;
@@ -30,6 +30,9 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
   const [identity, setIdentity] = useState('');
   const [identities, setIdentities] = useState<string[]>([]);
   const [installing, setInstalling] = useState(false);
+
+  // 两阶段重签名状态
+  const [decompileSession, setDecompileSession] = useState<{ sessionId: string; decodeDir: string } | null>(null);
 
   const isDark = theme === 'dark';
 
@@ -126,59 +129,105 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
   };
 
   const handleSign = async () => {
-    if (!keystorePath || !storePass || !keyAlias) {
+    if (platform === 'android' && (!keystorePath || !storePass || !keyAlias)) {
       onError('请输入 Keystore 信息并选择 Alias');
       return;
     }
-    
+
     setLoading(true);
     setResult(null);
     setLogs([]);
+    setDecompileSession(null);
+
     try {
+      // Android Hook 模式：两阶段流程 - 先解包，等待用户确认后再签名
+      if (platform === 'android' && useHook) {
+        const { sessionId, decodeDir } = await window.ipcRenderer.invoke('signer-decompile-apk', { apkPath });
+        setDecompileSession({ sessionId, decodeDir });
+        // 解包完成后停止 loading，等待用户操作
+        return;
+      }
+
+      // 其他情况：一步完成
       let res: SignResult;
       if (platform === 'android') {
-        if (useHook) {
-          res = await window.ipcRenderer.invoke('signer-inject-resign-apk', {
-            apkPath, keystorePath, storePass, alias: keyAlias, keyPass, buildToolsPath
-          });
-        } else {
-          res = await window.ipcRenderer.invoke('signer-resign-apk', {
-            apkPath, keystorePath, storePass, alias: keyAlias, keyPass, buildToolsPath
-          });
-        }
+        res = await window.ipcRenderer.invoke('signer-resign-apk', {
+          apkPath, keystorePath, storePass, alias: keyAlias, keyPass, buildToolsPath
+        });
       } else {
         res = await window.ipcRenderer.invoke('signer-resign-ipa', {
           ipaPath, mobileProvisionPath, identity
         });
       }
-      setResult(res);
-      
-      // 如果重签名成功，自动分析新文件的签名信息
-      if (res.success && res.outputPath) {
-        // 添加分隔线
-        setLogs(prev => [...prev, '', '══════════════════════════════', '【重签名后的签名信息】', '══════════════════════════════', '']);
-        
-        // 分析新文件的签名
-        if (platform === 'android') {
-          try {
-            await window.ipcRenderer.invoke('signer-analyze-apk', { apkPath: res.outputPath, isResigned: true });
-          } catch (e: any) {
-            console.error('Failed to analyze signed APK:', e);
-          }
-        } else {
-          try {
-            await window.ipcRenderer.invoke('signer-analyze-ipa', { ipaPath: res.outputPath, isResigned: true });
-          } catch (e: any) {
-            console.error('Failed to analyze signed IPA:', e);
-          }
-        }
-      } else if (!res.success) {
-        onError(res.message);
-      }
+      await finalizeResult(res);
     } catch (e: any) {
       onError(e.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleContinueResign = async () => {
+    if (!decompileSession) return;
+    if (!keystorePath || !storePass || !keyAlias) {
+      onError('请输入 Keystore 信息并选择 Alias');
+      return;
+    }
+
+    setLoading(true);
+    const { sessionId } = decompileSession;
+    setDecompileSession(null);
+
+    try {
+      const res: SignResult = await window.ipcRenderer.invoke('signer-continue-resign-apk', {
+        sessionId, keystorePath, storePass, alias: keyAlias, keyPass
+      });
+      await finalizeResult(res);
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCancelSession = async () => {
+    if (!decompileSession) return;
+    try {
+      await window.ipcRenderer.invoke('signer-cancel-session', { sessionId: decompileSession.sessionId });
+    } catch (e) {
+      // ignore
+    }
+    setDecompileSession(null);
+  };
+
+  const handleOpenDecodeDir = async () => {
+    if (!decompileSession) return;
+    try {
+      await window.ipcRenderer.invoke('signer-open-path', { dirPath: decompileSession.decodeDir });
+    } catch (e: any) {
+      onError(e.message);
+    }
+  };
+
+  const finalizeResult = async (res: SignResult) => {
+    setResult(res);
+    if (res.success && res.outputPath) {
+      setLogs(prev => [...prev, '', '══════════════════════════════', '【重签名后的签名信息】', '══════════════════════════════', '']);
+      if (platform === 'android') {
+        try {
+          await window.ipcRenderer.invoke('signer-analyze-apk', { apkPath: res.outputPath, isResigned: true });
+        } catch (e: any) {
+          console.error('Failed to analyze signed APK:', e);
+        }
+      } else {
+        try {
+          await window.ipcRenderer.invoke('signer-analyze-ipa', { ipaPath: res.outputPath, isResigned: true });
+        } catch (e: any) {
+          console.error('Failed to analyze signed IPA:', e);
+        }
+      }
+    } else if (!res.success) {
+      onError(res.message);
     }
   };
 
@@ -390,11 +439,13 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
 
           <button
             onClick={handleSign}
-            disabled={loading || installing}
-            className={`w-full py-3 rounded-xl font-bold uppercase tracking-widest text-xs text-white transition-all flex items-center justify-center gap-2 ${loading ? 'bg-blue-600/50 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-900/20 active:scale-[0.98]'}`}
+            disabled={loading || installing || !!decompileSession}
+            className={`w-full py-3 rounded-xl font-bold uppercase tracking-widest text-xs text-white transition-all flex items-center justify-center gap-2 ${
+              (loading || !!decompileSession) ? 'bg-blue-600/50 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-900/20 active:scale-[0.98]'
+            }`}
           >
             {loading ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />}
-            {loading ? 'Processing...' : 'Execute Resign'}
+            {loading ? 'Processing...' : decompileSession ? 'Waiting...' : 'Execute Resign'}
           </button>
 
           <button
@@ -413,8 +464,8 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
         {/* 顶部工具栏 - OPERATION STATUS */}
         <div className={`h-10 px-4 flex items-center justify-between border-b shrink-0 ${isDark ? 'bg-[#252529] border-zinc-700/50 text-zinc-400' : 'bg-[#e2e8f0] border-slate-300 text-slate-700'}`}>
           <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wider">
-            <Activity size={12} className={loading ? 'text-blue-500 animate-pulse' : ''} />
-            {loading ? 'TASK IN PROGRESS' : 'OPERATION STATUS'}
+            <Activity size={12} className={loading ? 'text-blue-500 animate-pulse' : decompileSession ? 'text-amber-500' : ''} />
+            {loading ? 'TASK IN PROGRESS' : decompileSession ? 'WAITING FOR USER' : 'OPERATION STATUS'}
           </div>
         </div>
 
@@ -452,6 +503,64 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
             </div>
           )}
         </div>
+
+        {/* 解包完成 - 等待用户交互面板 */}
+        {decompileSession && (
+          <div className={`shrink-0 border-t animate-in slide-in-from-bottom-2 fade-in duration-300 ${
+            isDark ? 'bg-amber-500/8 border-amber-500/20' : 'bg-amber-50 border-amber-200 shadow-[0_-4px_20px_-4px_rgba(0,0,0,0.05)]'
+          }`}>
+            {/* 标题行 */}
+            <div className={`flex items-center justify-between px-4 pt-3 pb-2`}>
+              <div className="flex items-center gap-2">
+                <div className={`p-1.5 rounded-full ${isDark ? 'bg-amber-500/20 text-amber-400' : 'bg-amber-100 text-amber-600'}`}>
+                  <FolderOpen size={14} />
+                </div>
+                <div>
+                  <span className={`text-[10px] font-bold uppercase tracking-wider ${isDark ? 'text-amber-400' : 'text-amber-700'}`}>
+                    解包完成 · 等待操作
+                  </span>
+                  <p className={`text-[9px] font-mono mt-0.5 truncate max-w-xs ${isDark ? 'text-zinc-500' : 'text-zinc-400'}`}
+                     title={decompileSession.decodeDir}>
+                    {decompileSession.decodeDir}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleCancelSession}
+                className={`p-1.5 rounded-lg transition-colors ${isDark ? 'hover:bg-white/10 text-zinc-500 hover:text-zinc-300' : 'hover:bg-black/5 text-zinc-400 hover:text-zinc-600'}`}
+              >
+                <X size={13} />
+              </button>
+            </div>
+
+            {/* 提示文字 */}
+            <p className={`px-4 pb-2 text-[10px] leading-relaxed ${isDark ? 'text-zinc-500' : 'text-zinc-500'}`}>
+              可打开目录替换 res / lib / assets 等资源文件或 .so 文件，完成后点击继续重打包签名；也可直接跳过继续。
+            </p>
+
+            {/* 操作按钮 */}
+            <div className="flex gap-2 px-4 pb-3">
+              <button
+                onClick={handleOpenDecodeDir}
+                className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-all ${
+                  isDark
+                    ? 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'
+                    : 'bg-white border-zinc-300 text-zinc-700 hover:bg-zinc-50 shadow-sm'
+                }`}
+              >
+                <FolderOpen size={12} />
+                在 Finder 中打开
+              </button>
+              <button
+                onClick={handleContinueResign}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-white bg-blue-600 hover:bg-blue-500 transition-all shadow-lg shadow-blue-900/20 active:scale-[0.98]"
+              >
+                <Play size={12} />
+                继续重打包签名
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* 底部结果状态栏 - 仅在有结果时显示 */}
         {result && (

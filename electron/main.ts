@@ -4,7 +4,7 @@ import { fixPath } from './utils/env'
 import { getDevices, getAndroidApps, getAndroidAppIcon } from './services/deviceService'
 import { startLogging, stopLogging } from './services/logService'
 import { listDirectory, downloadFile, downloadFileToTemp, deleteTarget, mkdir, upload, listIosApps, renameFile, createFile, checkJailbreak, getIosAppIcon } from './services/fileService'
-import { getKeystoreAliases, analyzeApk, resignApk, getIosIdentities, resignIpa, injectAndResignApk } from './services/signerService'
+import { getKeystoreAliases, analyzeApk, resignApk, getIosIdentities, resignIpa, injectAndResignApk, decompileApkForEdit, resignFromDecompiled, cleanupDecompileSession, DecompileSession } from './services/signerService'
 import { installApp, installAppFromDevice } from './services/installService'
 import { decryptApp } from './services/fridaService'
 import { getBuildToolsPath } from './utils/paths'
@@ -481,6 +481,9 @@ function setupIpcHandlers() {
     console.error('[IPC] Failed to register File System handlers:', e);
   }
 
+  // 解包会话存储（两阶段重签名用）
+  const decompileSessions = new Map<string, DecompileSession>();
+
   // Signer Handlers
   try {
     ipcMain.handle('signer-get-aliases', async (_event, { path, pass }) => {
@@ -537,6 +540,56 @@ function setupIpcHandlers() {
       return tool;
     })
     console.log('[IPC] Registered: signer-get-build-tools');
+
+    // 两阶段重签名：阶段一 - 解包
+    ipcMain.handle('signer-decompile-apk', async (event, args: { apkPath: string }) => {
+      const session = await decompileApkForEdit({
+        apkPath: args.apkPath,
+        onLog: (msg: string) => event.sender.send('signer-log', msg)
+      });
+      const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      decompileSessions.set(sessionId, session);
+      return { sessionId, decodeDir: session.decodeDir };
+    });
+
+    // 两阶段重签名：阶段二 - 继续注入 + 打包 + 签名
+    ipcMain.handle('signer-continue-resign-apk', async (event, args: {
+      sessionId: string;
+      keystorePath: string;
+      storePass: string;
+      keyPass: string;
+      alias: string;
+    }) => {
+      const session = decompileSessions.get(args.sessionId);
+      if (!session) return { success: false, message: '会话不存在或已过期，请重新解包' };
+      decompileSessions.delete(args.sessionId);
+      return await resignFromDecompiled({
+        session,
+        keystorePath: args.keystorePath,
+        storePass: args.storePass,
+        keyPass: args.keyPass,
+        alias: args.alias,
+        onLog: (msg: string) => event.sender.send('signer-log', msg)
+      });
+    });
+
+    // 取消解包会话（清理临时目录）
+    ipcMain.handle('signer-cancel-session', async (_event, args: { sessionId: string }) => {
+      const session = decompileSessions.get(args.sessionId);
+      if (session) {
+        cleanupDecompileSession(session);
+        decompileSessions.delete(args.sessionId);
+      }
+      return true;
+    });
+
+    // 在系统文件管理器中打开目录
+    ipcMain.handle('signer-open-path', async (_event, args: { dirPath: string }) => {
+      const { shell } = await import('electron');
+      await shell.openPath(args.dirPath);
+      return true;
+    });
+
   } catch (e) {
     console.error('[IPC] Failed to register Signer handlers:', e);
   }

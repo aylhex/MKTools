@@ -524,15 +524,6 @@ function App() {
           />
           <div className="flex-1 flex flex-col h-full overflow-hidden relative">
             <div className="flex-1 relative">
-              {isLogging && logs.length === 0 && !error && (
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-                  <div className="flex flex-col items-center gap-3 opacity-40">
-                    <div className="w-12 h-12 rounded-full border-4 border-zinc-500/20 border-t-zinc-500 animate-spin" />
-                    <div className="text-zinc-500 text-xs font-medium uppercase tracking-widest">Waiting for stream...</div>
-                  </div>
-                </div>
-              )}
-              
               {isLogging && logs.length > 0 && filteredLogs.length === 0 && (
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
                   <div className={`flex flex-col items-center gap-4 p-8 rounded-2xl border shadow-2xl animate-in fade-in zoom-in-95 duration-200 ${
@@ -555,7 +546,7 @@ function App() {
                 </div>
               )}
 
-              <LogViewer 
+              <LogViewer
                 key={selectedDevice}
                 logs={filteredLogs}
                 autoScroll={autoScroll}
@@ -567,6 +558,7 @@ function App() {
                 theme={theme}
                 onClearLogs={handleClearLogs}
                 hasSelectedDevice={!!selectedDevice}
+                isLogging={isLogging}
               />
             </div>
           </div>

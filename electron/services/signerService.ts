@@ -195,7 +195,139 @@ async function getCertHexUsingApkSig(apkPath: string, onLog?: (msg: string) => v
 }
 
 /**
- * 注入并重签名 (核心功能)
+ * 解包会话状态（用于两阶段重签名）
+ */
+export interface DecompileSession {
+  tempDir: string;
+  decodeDir: string;
+  apkPath: string;
+  originalSignature: string;
+  packageName: string;
+}
+
+/**
+ * 阶段一：仅解包 APK，返回会话状态，等待用户操作
+ */
+export async function decompileApkForEdit(args: {
+  apkPath: string;
+  onLog?: (msg: string) => void;
+}): Promise<DecompileSession> {
+  const { apkPath, onLog } = args;
+
+  if (!apkPath || !fs.existsSync(apkPath)) throw new Error('APK 不存在');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apk-inject-'));
+  const decodeDir = path.join(tempDir, 'decoded');
+  const apktool = getJarToolPath('apktool.jar');
+
+  // 0. 提取原始签名
+  if (onLog) onLog('正在提取原始签名...');
+  const originalSignature = await getOriginalSignature(apkPath, onLog);
+  if (!originalSignature || originalSignature === '00') {
+    if (onLog) onLog('警告: 无法提取原始签名，生成的 APK 可能无法通过签名验证');
+  } else {
+    if (onLog) onLog(`提取签名成功 (长度: ${originalSignature.length})\nSignature: ${originalSignature}`);
+  }
+
+  // 0.5 获取包名
+  let packageName = '';
+  try {
+    const info = await analyzeApk(apkPath);
+    if (info && info.packageName && info.packageName !== 'Unknown') {
+      packageName = info.packageName;
+      if (onLog) onLog(`获取包名成功: ${packageName}`);
+    }
+  } catch (e) {
+    if (onLog) onLog(`获取包名失败 (aapt): ${e}`);
+  }
+
+  // 1. 反编译
+  if (onLog) onLog('正在反编译 APK (apktool)...');
+  await execWithLog(`java -jar "${apktool}" d -r -f -o "${decodeDir}" "${apkPath}"`, onLog);
+
+  if (onLog) onLog(`\n解包完成，目录: ${decodeDir}`);
+
+  return { tempDir, decodeDir, apkPath, originalSignature, packageName };
+}
+
+/**
+ * 清理解包会话的临时目录
+ */
+export function cleanupDecompileSession(session: DecompileSession): void {
+  if (fs.existsSync(session.tempDir)) {
+    fs.rmSync(session.tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 阶段二：从已解包目录继续注入 + 回编译 + 签名
+ */
+export async function resignFromDecompiled(args: {
+  session: DecompileSession;
+  keystorePath: string;
+  storePass: string;
+  keyPass: string;
+  alias: string;
+  onLog?: (msg: string) => void;
+}): Promise<SignResult> {
+  const { session, keystorePath, storePass, keyPass, alias, onLog } = args;
+  const { tempDir, decodeDir, apkPath, originalSignature, packageName } = session;
+  const outputApk = apkPath.replace('.apk', '_hooked_signed.apk');
+  const apktool = getJarToolPath('apktool.jar');
+
+  try {
+    // 2. 注入 Hook 代码
+    if (onLog) onLog('正在注入 Hook 代码...');
+    const { manifestModified, binaryManifestPath } = await injectHookCode(decodeDir, originalSignature, packageName, apkPath, onLog);
+
+    // 3. 回编译
+    if (onLog) onLog('正在回编译 APK (apktool)...');
+    const buildApk = path.join(tempDir, 'dist.apk');
+    await execWithLog(`java -jar "${apktool}" b -o "${buildApk}" "${decodeDir}"`, onLog);
+
+    // 4. 合并 Dex
+    if (onLog) onLog('合并 Dex 到原始 APK (保留原始资源)...');
+    const mergedApk = path.join(tempDir, 'merged.apk');
+    await mergeDexIntoOriginalApk(apkPath, buildApk, mergedApk, manifestModified, binaryManifestPath, onLog);
+
+    // 5. 对齐 (zipalign)
+    if (onLog) onLog('执行 zipalign 对齐...');
+    const buildToolsPath = getBuildToolsPath();
+    const zipalign = path.join(buildToolsPath, process.platform === 'win32' ? 'zipalign.exe' : 'zipalign');
+    const alignedApk = path.join(tempDir, 'aligned.apk');
+
+    if (fs.existsSync(zipalign)) {
+      await execWithLog(`"${zipalign}" -f -p 4 "${mergedApk}" "${alignedApk}"`, onLog);
+    } else {
+      if (onLog) onLog('警告: 未找到 zipalign，跳过对齐步骤');
+      fs.copyFileSync(mergedApk, alignedApk);
+    }
+
+    // 6. 签名
+    if (onLog) onLog('正在签名...');
+    const signResult = await resignApk({ apkPath: alignedApk, keystorePath, storePass, keyPass, alias, onLog });
+
+    if (!signResult.success) throw new Error(signResult.message);
+
+    const signedTemp = alignedApk.replace('.apk', '_signed.apk');
+    if (fs.existsSync(signedTemp)) {
+      fs.copyFileSync(signedTemp, outputApk);
+      return { success: true, message: '注入并签名成功', outputPath: outputApk };
+    } else {
+      throw new Error('签名后文件未生成');
+    }
+  } catch (e: any) {
+    if (onLog) onLog(`处理失败: ${e.message}`);
+    return { success: false, message: `处理失败: ${e.message}` };
+  } finally {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+/**
+ * 注入并重签名 (核心功能 - 保留向后兼容)
  */
 export async function injectAndResignApk(args: {
   apkPath: string,
@@ -206,99 +338,9 @@ export async function injectAndResignApk(args: {
   onLog?: (msg: string) => void
 }): Promise<SignResult> {
   const { apkPath, keystorePath, storePass, keyPass, alias, onLog } = args;
-  
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apk-inject-'));
-  const decodeDir = path.join(tempDir, 'decoded');
-  const outputApk = apkPath.replace('.apk', '_hooked_signed.apk');
-  const apktool = getJarToolPath('apktool.jar');
-  
-  try {
-    // 0. 提取原始签名
-    if (onLog) onLog('正在提取原始签名...');
-    const originalSignature = await getOriginalSignature(apkPath, onLog);
-    if (!originalSignature || originalSignature === '00') {
-        if (onLog) onLog('警告: 无法提取原始签名，生成的 APK 可能无法通过签名验证');
-    } else {
-        if (onLog) onLog(`提取签名成功 (长度: ${originalSignature.length})\nSignature: ${originalSignature}`);
-    }
 
-    // 0.5 获取包名 (优先使用 aapt 获取)
-    let packageName = '';
-    try {
-        const info = await analyzeApk(apkPath);
-        if (info && info.packageName && info.packageName !== 'Unknown') {
-            packageName = info.packageName;
-            if (onLog) onLog(`获取包名成功: ${packageName}`);
-        }
-    } catch (e) {
-        if (onLog) onLog(`获取包名失败 (aapt): ${e}`);
-    }
-
-    // 1. 反编译
-    if (onLog) onLog('正在反编译 APK (apktool)...');
-    await execWithLog(`java -jar "${apktool}" d -r -f -o "${decodeDir}" "${apkPath}"`, onLog);
-
-    // 2. 注入 Hook 代码
-    if (onLog) onLog('正在注入 Hook 代码...');
-    const { manifestModified, binaryManifestPath } = await injectHookCode(decodeDir, originalSignature, packageName, apkPath, onLog);
-
-    // 3. 回编译
-    if (onLog) onLog('正在回编译 APK (apktool)...');
-    const buildApk = path.join(tempDir, 'dist.apk');
-    await execWithLog(`java -jar "${apktool}" b -o "${buildApk}" "${decodeDir}"`, onLog);
-
-    // 4. 合并 Dex (解决 residual dex 问题)
-    if (onLog) onLog('合并 Dex 到原始 APK (保留原始资源)...');
-    const mergedApk = path.join(tempDir, 'merged.apk');
-    await mergeDexIntoOriginalApk(apkPath, buildApk, mergedApk, manifestModified, binaryManifestPath, onLog);
-
-    // 5. 对齐 (zipalign)
-    if (onLog) onLog('执行 zipalign 对齐...');
-    const buildToolsPath = getBuildToolsPath();
-    const zipalign = path.join(buildToolsPath, process.platform === 'win32' ? 'zipalign.exe' : 'zipalign');
-    const alignedApk = path.join(tempDir, 'aligned.apk');
-    
-    if (fs.existsSync(zipalign)) {
-      // app_signer uses -p 4
-      await execWithLog(`"${zipalign}" -f -p 4 "${mergedApk}" "${alignedApk}"`, onLog);
-    } else {
-      if (onLog) onLog('警告: 未找到 zipalign，跳过对齐步骤');
-      fs.copyFileSync(mergedApk, alignedApk);
-    }
-
-    // 6. 签名
-    if (onLog) onLog('正在签名...');
-    const signResult = await resignApk({
-      apkPath: alignedApk,
-      keystorePath,
-      storePass,
-      keyPass,
-      alias,
-      onLog
-    });
-    
-    if (!signResult.success) {
-        throw new Error(signResult.message);
-    }
-    
-    // 移动最终文件
-    const signedTemp = alignedApk.replace('.apk', '_signed.apk');
-    if (fs.existsSync(signedTemp)) {
-        fs.copyFileSync(signedTemp, outputApk);
-        return { success: true, message: '注入并签名成功', outputPath: outputApk };
-    } else {
-        throw new Error('签名后文件未生成');
-    }
-
-  } catch (e: any) {
-    if (onLog) onLog(`处理失败: ${e.message}`);
-    return { success: false, message: `处理失败: ${e.message}` };
-  } finally {
-    // 清理临时目录
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
+  const session = await decompileApkForEdit({ apkPath, onLog });
+  return await resignFromDecompiled({ session, keystorePath, storePass, keyPass, alias, onLog });
 }
 
 async function injectHookCode(decodeDir: string, signature: string, packageName: string, originalApkPath: string, onLog?: (msg: string) => void): Promise<{ manifestModified: boolean, binaryManifestPath?: string }> {

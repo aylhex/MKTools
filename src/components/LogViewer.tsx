@@ -13,6 +13,7 @@ interface LogViewerProps {
   theme: Theme;
   onClearLogs?: () => void;
   hasSelectedDevice?: boolean;
+  isLogging?: boolean;
 }
 
 const getLevelColor = (level: string, theme: Theme) => {
@@ -74,7 +75,7 @@ const getIosTypeLabel = (level: string) => {
 
 // 紧急回退：使用最基础的列表渲染，不依赖任何第三方虚拟滚动库
 // 以排除 react-virtuoso 导致的布局或渲染崩溃问题
-export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll, onToggleAutoScroll, platform = 'android', theme, onClearLogs, hasSelectedDevice = false }) => {
+export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll, onToggleAutoScroll, platform = 'android', theme, onClearLogs, hasSelectedDevice = false, isLogging = false }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const isAutoScrolling = useRef(false);
   const userScrolledAway = useRef(false); // 新增：追踪用户是否主动滚动离开底部
@@ -99,6 +100,14 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
     window.addEventListener('click', handleClick);
     return () => window.removeEventListener('click', handleClick);
   }, []);
+
+  // 当外部清空日志时，重置冻结状态
+  useEffect(() => {
+    if (logs.length === 0) {
+      frozenLogs.current = [];
+      userScrolledAway.current = false;
+    }
+  }, [logs]);
 
   // 当用户暂停滚动时，冻结日志数组，避免页面不断更新
   useEffect(() => {
@@ -320,6 +329,8 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
 
   // 清除日志
   const handleClearLogsClick = () => {
+    frozenLogs.current = [];
+    userScrolledAway.current = false;
     if (onClearLogs) {
       onClearLogs();
     }
@@ -378,9 +389,18 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
         }}
       >
         {displayLogs.length === 0 && (
-            <div className={`flex flex-col items-center justify-center h-full ${isDark ? 'text-zinc-600' : 'text-slate-400'} gap-4 opacity-50`}>
-                <Terminal size={48} strokeWidth={1} />
-                <div className="text-sm font-medium">Waiting for logs...</div>
+            <div className={`flex flex-col items-center justify-center h-full gap-4`}>
+              {isLogging ? (
+                <div className="flex flex-col items-center gap-3 opacity-40">
+                  <div className="w-12 h-12 rounded-full border-4 border-zinc-500/20 border-t-zinc-500 animate-spin" />
+                  <div className="text-zinc-500 text-xs font-medium uppercase tracking-widest">Waiting for stream...</div>
+                </div>
+              ) : (
+                <div className={`flex flex-col items-center gap-4 opacity-50 ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>
+                  <Terminal size={48} strokeWidth={1} />
+                  <div className="text-sm font-medium">Waiting for logs...</div>
+                </div>
+              )}
             </div>
         )}
         
