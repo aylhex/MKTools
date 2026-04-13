@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Theme, FileEntry } from '../types';
-import { RefreshCw, FolderPlus, Upload, Download, Trash2, HardDrive, ChevronRight, ChevronDown, Folder, File, FolderOpen } from 'lucide-react';
+import { RefreshCw, FolderPlus, Upload, Download, Trash2, HardDrive, ChevronRight, ChevronDown, Folder, File, FolderOpen, CornerLeftUp } from 'lucide-react';
 import { Tooltip } from './Tooltip';
 
 interface FileManagerProps {
@@ -1043,7 +1043,27 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
                 </tr>
               </thead>
               <tbody className={`text-xs ${isDark ? 'text-zinc-300' : 'text-slate-700'}`}>
-                {entries.map((e) => (
+                {selectedPath && selectedPath !== '/' && (
+                  <tr
+                    onClick={() => {
+                      const parts = selectedPath.split('/').filter(Boolean);
+                      const parentPath = parts.length > 0 ? '/' + parts.slice(0, -1).join('/') : '/';
+                      loadDirectoryContent(parentPath || '/');
+                    }}
+                    className={`group transition-all cursor-pointer border-b ${isDark ? 'hover:bg-zinc-900/50 border-zinc-700/30' : 'hover:bg-white border-slate-300/50'}`}
+                  >
+                    <td className="px-6 py-3 text-center">
+                      <CornerLeftUp size={15} className={isDark ? 'text-zinc-500' : 'text-slate-400'} />
+                    </td>
+                    <td className="px-4 py-3 font-medium" colSpan={4}>
+                      <div className="flex items-center gap-2">
+                        <span className={`font-mono ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>..</span>
+                        <span className={`text-[10px] ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>返回上一目录</span>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                {entries.filter(e => e.name !== '..').map((e) => (
                   <tr 
                     key={e.name}
                     onClick={() => setSelected(e.name)}

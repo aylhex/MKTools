@@ -23,7 +23,11 @@ if (process.platform === 'darwin') {
 app.setName('MKTools');
 
 // 修复 macOS/Linux 上的 PATH 问题
-fixPath();
+fixPath()
+
+// 尽早注册 IPC 处理程序（模块加载时立即注册，避免任何时序问题）
+// safeHandle 在内部调用 ipcMain.removeHandler，处理热重载重复注册问题
+setupIpcHandlers();
 
 // 设置 About 面板信息（macOS）
 if (process.platform === 'darwin') {
@@ -133,25 +137,31 @@ app.on('activate', () => {
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
   if (BrowserWindow.getAllWindows().length === 0) {
+    try { setupIpcHandlers(); } catch (_) {}
     createWindow()
   }
 })
 
 app.whenReady().then(() => {
   console.log('[Main] App is ready');
-  
+
   // 再次强制设置应用名称（确保在 ready 后生效）
-  app.setName('MKTools');
-  
+  try { app.setName('MKTools'); } catch (_) {}
+
   // 在 macOS 上设置 Dock 图标
-  if (process.platform === 'darwin' && process.env.VITE_PUBLIC) {
-    const iconPath = path.join(process.env.VITE_PUBLIC, 'icon.png')
-    if (app.dock) {
-      app.dock.setIcon(iconPath)
+  try {
+    if (process.platform === 'darwin' && process.env.VITE_PUBLIC) {
+      const iconPath = path.join(process.env.VITE_PUBLIC, 'icon.png')
+      if (app.dock) {
+        app.dock.setIcon(iconPath)
+      }
     }
+  } catch (e) {
+    console.warn('[Main] Failed to set dock icon:', e);
   }
-  
+
   // 设置应用菜单（确保显示正确的应用名称）
+  try {
   if (process.platform === 'darwin') {
     const template: Electron.MenuItemConstructorOptions[] = [
       {
@@ -231,7 +241,10 @@ app.whenReady().then(() => {
     const menu = Menu.buildFromTemplate(template)
     Menu.setApplicationMenu(menu)
   }
-  
+  } catch (e) {
+    console.warn('[Main] Failed to build menu:', e);
+  }
+
   // 注册 IPC 处理程序（必须在创建窗口之前注册，以防页面加载过快导致竞态条件）
   try {
     setupIpcHandlers()
@@ -250,8 +263,15 @@ app.whenReady().then(() => {
 function setupIpcHandlers() {
   console.log('[IPC] Setting up IPC handlers...');
 
+  // Safe wrapper: removes any existing handler before registering, so hot-reload
+  // in dev mode never throws "Attempted to register a second handler for '<channel>'".
+  function safeHandle(channel: string, handler: Parameters<typeof ipcMain.handle>[1]) {
+    ipcMain.removeHandler(channel);
+    ipcMain.handle(channel, handler);
+  }
+
   try {
-    ipcMain.handle('get-devices', async () => {
+    safeHandle('get-devices', async () => {
     console.log('[IPC] get-devices handler called');
     try {
       const devices = await getDevices();
@@ -263,7 +283,7 @@ function setupIpcHandlers() {
   })
   console.log('[IPC] Registered: get-devices');
 
-  ipcMain.handle('get-installed-apps', async (_event, args: { deviceId: string; platform: 'android' | 'ios' }) => {
+  safeHandle('get-installed-apps', async (_event, args: { deviceId: string; platform: 'android' | 'ios' }) => {
       console.log(`[IPC] get-installed-apps handler called for ${args.platform} device ${args.deviceId}`);
       try {
         if (args.platform === 'android') {
@@ -278,7 +298,7 @@ function setupIpcHandlers() {
       }
     })
 
-    ipcMain.handle('get-app-icon', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; packageName: string }) => {
+    safeHandle('get-app-icon', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; packageName: string }) => {
       try {
         if (args.platform === 'android') {
           return await getAndroidAppIcon(args.deviceId, args.packageName);
@@ -292,7 +312,7 @@ function setupIpcHandlers() {
       }
     })
 
-    ipcMain.handle('decrypt-app', async (event, args: { deviceId: string; platform: 'android' | 'ios'; bundleId: string; outputDir?: string }) => {
+    safeHandle('decrypt-app', async (event, args: { deviceId: string; platform: 'android' | 'ios'; bundleId: string; outputDir?: string }) => {
       console.log(`[IPC] decrypt-app handler called for ${args.bundleId} on ${args.platform}`);
       try {
         const result = await decryptApp(args, (msg) => {
@@ -305,7 +325,7 @@ function setupIpcHandlers() {
       }
     })
 
-    ipcMain.handle('extract-ios-headers', async (event, args: { ipaPath: string }) => {
+    safeHandle('extract-ios-headers', async (event, args: { ipaPath: string }) => {
       console.log(`[IPC] extract-ios-headers handler called for ${args.ipaPath}`);
       try {
         const { extractIosHeaders } = await import('./services/fridaService');
@@ -319,7 +339,7 @@ function setupIpcHandlers() {
       }
     })
 
-    ipcMain.handle('fetch-frida-app-list', async (event, args: { deviceId: string; platform: 'android' | 'ios' }) => {
+    safeHandle('fetch-frida-app-list', async (event, args: { deviceId: string; platform: 'android' | 'ios' }) => {
       console.log(`[IPC] fetch-frida-app-list handler called for ${args.platform} device ${args.deviceId}`);
       try {
         // Dynamic import to avoid circular dependencies if any, though imports are top-level usually.
@@ -339,7 +359,7 @@ function setupIpcHandlers() {
     })
     
     // Icon cache handlers
-    ipcMain.handle('save-icon-to-cache', async (_event, args: { deviceId: string; platform: string; packageName: string; icon: string }) => {
+    safeHandle('save-icon-to-cache', async (_event, args: { deviceId: string; platform: string; packageName: string; icon: string }) => {
       try {
         await saveIconToCache(args.deviceId, args.platform, args.packageName, args.icon);
         return true;
@@ -349,7 +369,7 @@ function setupIpcHandlers() {
       }
     })
     
-    ipcMain.handle('get-icon-from-cache', async (_event, args: { deviceId: string; platform: string; packageName: string }) => {
+    safeHandle('get-icon-from-cache', async (_event, args: { deviceId: string; platform: string; packageName: string }) => {
       try {
         return await getIconFromCache(args.deviceId, args.platform, args.packageName);
       } catch (e: any) {
@@ -358,7 +378,7 @@ function setupIpcHandlers() {
       }
     })
     
-    ipcMain.handle('get-icons-from-cache', async (_event, args: { deviceId: string; platform: string; packageNames: string[] }) => {
+    safeHandle('get-icons-from-cache', async (_event, args: { deviceId: string; platform: string; packageNames: string[] }) => {
       try {
         const iconsMap = await getIconsBatch(args.deviceId, args.platform, args.packageNames);
         // Convert Map to plain object for IPC
@@ -373,7 +393,7 @@ function setupIpcHandlers() {
       }
     })
     
-    ipcMain.handle('clear-icon-cache', async () => {
+    safeHandle('clear-icon-cache', async () => {
       try {
         await clearIconCache();
         return true;
@@ -383,7 +403,7 @@ function setupIpcHandlers() {
       }
     })
     
-    ipcMain.handle('get-cache-stats', async () => {
+    safeHandle('get-cache-stats', async () => {
       try {
         return await getCacheStats();
       } catch (e: any) {
@@ -405,35 +425,35 @@ function setupIpcHandlers() {
 
   // File System Handlers
   try {
-    ipcMain.handle('fs-list', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; path: string, bundleId?: string, skipSymlinkResolution?: boolean }) => {
+    safeHandle('fs-list', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; path: string, bundleId?: string, skipSymlinkResolution?: boolean }) => {
       return await listDirectory(args, args.skipSymlinkResolution || false);
     })
 
-    ipcMain.handle('fs-download', async (event, args: { deviceId: string; platform: 'android' | 'ios'; remotePath: string, bundleId?: string }) => {
+    safeHandle('fs-download', async (event, args: { deviceId: string; platform: 'android' | 'ios'; remotePath: string, bundleId?: string }) => {
       const result = await downloadFile(args, (percent) => {
         event.sender.send('download-progress', { percent, completed: percent === 100 });
       });
       return result;
     })
 
-    ipcMain.handle('fs-download-temp', async (event, args: { deviceId: string; platform: 'android' | 'ios'; remotePath: string, bundleId?: string }) => {
+    safeHandle('fs-download-temp', async (event, args: { deviceId: string; platform: 'android' | 'ios'; remotePath: string, bundleId?: string }) => {
       const result = await downloadFileToTemp(args, (percent) => {
         event.sender.send('download-progress', { percent, completed: percent === 100 });
       });
       return result;
     })
 
-    ipcMain.handle('install-app', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; filePath: string; fileType: 'apk' | 'ipa' }) => {
+    safeHandle('install-app', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; filePath: string; fileType: 'apk' | 'ipa' }) => {
       await installApp(args.deviceId, args.platform, args.filePath, args.fileType);
       return true;
     })
 
-    ipcMain.handle('install-app-from-device', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; devicePath: string; fileType: 'apk' | 'ipa' }) => {
+    safeHandle('install-app-from-device', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; devicePath: string; fileType: 'apk' | 'ipa' }) => {
       await installAppFromDevice(args.deviceId, args.platform, args.devicePath, args.fileType);
       return true;
     })
 
-    ipcMain.handle('select-local-file', async (_event, args: { filters: { name: string; extensions: string[] }[] }) => {
+    safeHandle('select-local-file', async (_event, args: { filters: { name: string; extensions: string[] }[] }) => {
       const result = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: args.filters
@@ -446,34 +466,34 @@ function setupIpcHandlers() {
       return result.filePaths[0];
     })
 
-    ipcMain.handle('fs-delete', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; targetPath: string, bundleId?: string }) => {
+    safeHandle('fs-delete', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; targetPath: string, bundleId?: string }) => {
       await deleteTarget(args);
       return true;
     })
 
-    ipcMain.handle('fs-mkdir', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; dirPath: string, bundleId?: string }) => {
+    safeHandle('fs-mkdir', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; dirPath: string, bundleId?: string }) => {
       await mkdir(args);
       return true;
     })
 
-    ipcMain.handle('fs-rename', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; oldPath: string; newPath: string; bundleId?: string }) => {
+    safeHandle('fs-rename', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; oldPath: string; newPath: string; bundleId?: string }) => {
       await renameFile(args);
       return true;
     })
 
-    ipcMain.handle('fs-create-file', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; filePath: string; bundleId?: string }) => {
+    safeHandle('fs-create-file', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; filePath: string; bundleId?: string }) => {
       await createFile(args);
       return true;
     })
 
-    ipcMain.handle('fs-upload', async (event, args: { deviceId: string; platform: 'android' | 'ios'; destPath: string, bundleId?: string }) => {
+    safeHandle('fs-upload', async (event, args: { deviceId: string; platform: 'android' | 'ios'; destPath: string, bundleId?: string }) => {
       return await upload(args, (current, total, fileName) => {
         const percent = Math.round((current / total) * 100);
         event.sender.send('upload-progress', { current, total, percent, fileName });
       });
     })
 
-    ipcMain.handle('check-jailbreak', async (_event, args: { deviceId: string }) => {
+    safeHandle('check-jailbreak', async (_event, args: { deviceId: string }) => {
       return await checkJailbreak(args.deviceId);
     })
     console.log('[IPC] Registered: File System handlers');
@@ -486,31 +506,31 @@ function setupIpcHandlers() {
 
   // Signer Handlers
   try {
-    ipcMain.handle('signer-get-aliases', async (_event, { path, pass }) => {
+    safeHandle('signer-get-aliases', async (_event, { path, pass }) => {
       return await getKeystoreAliases(path, pass);
     })
 
-    ipcMain.handle('signer-resign-apk', async (event, args) => {
+    safeHandle('signer-resign-apk', async (event, args) => {
       return await resignApk({
         ...args,
         onLog: (msg: string) => event.sender.send('signer-log', msg)
       });
     })
 
-    ipcMain.handle('signer-get-ios-identities', async () => {
+    safeHandle('signer-get-ios-identities', async () => {
       console.log('[IPC] signer-get-ios-identities handler called');
       return await getIosIdentities();
     })
     console.log('[IPC] Registered: signer-get-ios-identities');
 
-    ipcMain.handle('signer-resign-ipa', async (event, args) => {
+    safeHandle('signer-resign-ipa', async (event, args) => {
       return await resignIpa({
         ...args,
         onLog: (msg: string) => event.sender.send('signer-log', msg)
       });
     })
 
-    ipcMain.handle('signer-analyze-apk', async (event, args: { apkPath: string; isResigned?: boolean }) => {
+    safeHandle('signer-analyze-apk', async (event, args: { apkPath: string; isResigned?: boolean }) => {
       const { analyzeApkSignature } = await import('./services/signerService');
       await analyzeApkSignature(args.apkPath, (msg: string) => {
         event.sender.send('signer-log', msg);
@@ -518,7 +538,7 @@ function setupIpcHandlers() {
       return true;
     })
 
-    ipcMain.handle('signer-analyze-ipa', async (event, args: { ipaPath: string; isResigned?: boolean }) => {
+    safeHandle('signer-analyze-ipa', async (event, args: { ipaPath: string; isResigned?: boolean }) => {
       const { analyzeIpaSignature } = await import('./services/signerService');
       await analyzeIpaSignature(args.ipaPath, (msg: string) => {
         event.sender.send('signer-log', msg);
@@ -526,14 +546,14 @@ function setupIpcHandlers() {
       return true;
     })
 
-    ipcMain.handle('signer-inject-resign-apk', async (event, args) => {
+    safeHandle('signer-inject-resign-apk', async (event, args) => {
       return await injectAndResignApk({
         ...args,
         onLog: (msg: string) => event.sender.send('signer-log', msg)
       });
     })
 
-    ipcMain.handle('signer-get-build-tools', async () => {
+    safeHandle('signer-get-build-tools', async () => {
       console.log('[IPC] signer-get-build-tools handler called');
       const tool = getBuildToolsPath();
       console.log('[IPC] Found build tools at:', tool);
@@ -542,7 +562,7 @@ function setupIpcHandlers() {
     console.log('[IPC] Registered: signer-get-build-tools');
 
     // 两阶段重签名：阶段一 - 解包
-    ipcMain.handle('signer-decompile-apk', async (event, args: { apkPath: string }) => {
+    safeHandle('signer-decompile-apk', async (event, args: { apkPath: string }) => {
       const session = await decompileApkForEdit({
         apkPath: args.apkPath,
         onLog: (msg: string) => event.sender.send('signer-log', msg)
@@ -553,7 +573,7 @@ function setupIpcHandlers() {
     });
 
     // 两阶段重签名：阶段二 - 继续注入 + 打包 + 签名
-    ipcMain.handle('signer-continue-resign-apk', async (event, args: {
+    safeHandle('signer-continue-resign-apk', async (event, args: {
       sessionId: string;
       keystorePath: string;
       storePass: string;
@@ -574,7 +594,7 @@ function setupIpcHandlers() {
     });
 
     // 取消解包会话（清理临时目录）
-    ipcMain.handle('signer-cancel-session', async (_event, args: { sessionId: string }) => {
+    safeHandle('signer-cancel-session', async (_event, args: { sessionId: string }) => {
       const session = decompileSessions.get(args.sessionId);
       if (session) {
         cleanupDecompileSession(session);
@@ -584,7 +604,7 @@ function setupIpcHandlers() {
     });
 
     // 在系统文件管理器中打开目录
-    ipcMain.handle('signer-open-path', async (_event, args: { dirPath: string }) => {
+    safeHandle('signer-open-path', async (_event, args: { dirPath: string }) => {
       const { shell } = await import('electron');
       await shell.openPath(args.dirPath);
       return true;
@@ -596,11 +616,11 @@ function setupIpcHandlers() {
 
   // Other Handlers
 
-  ipcMain.handle('ios-list-apps', async (_event, args: { deviceId: string }) => {
+  safeHandle('ios-list-apps', async (_event, args: { deviceId: string }) => {
     return await listIosApps(args.deviceId);
   })
 
-  ipcMain.handle('dialog-select-file', async (_event, options: { title?: string, filters?: { name: string, extensions: string[] }[] }) => {
+  safeHandle('dialog-select-file', async (_event, options: { title?: string, filters?: { name: string, extensions: string[] }[] }) => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       title: options.title,
       filters: options.filters,
@@ -610,7 +630,7 @@ function setupIpcHandlers() {
     return filePaths[0];
   })
 
-  ipcMain.handle('dialog-select-directory', async (_event, options: { title?: string }) => {
+  safeHandle('dialog-select-directory', async (_event, options: { title?: string }) => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       title: options.title,
       properties: ['openDirectory']
@@ -620,7 +640,7 @@ function setupIpcHandlers() {
   })
 
   // 简化的选择目录处理器（用于脱壳输出）
-  ipcMain.handle('select-directory', async () => {
+  safeHandle('select-directory', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       title: '选择脱壳文件输出目录',
       properties: ['openDirectory', 'createDirectory']
@@ -629,7 +649,7 @@ function setupIpcHandlers() {
     return filePaths[0];
   })
 
-  ipcMain.handle('dialog-prompt', async (_event, options: { title: string, message: string, defaultValue?: string }) => {
+  safeHandle('dialog-prompt', async (_event, options: { title: string, message: string, defaultValue?: string }) => {
     // 创建一个简单的输入窗口
     const promptWin = new BrowserWindow({
       width: 400,
