@@ -33,7 +33,7 @@ MKTools 是一款移动端应用分析工具箱(目前仅适配了Mac系统)。�
 
 <img src="docs/images/应用重签名.png" width="800" alt="应用重签名界面" />
 
-### 5. 🔓 应用砸壳 (App Decrypt)
+### 5. 🔓 应用脱壳 (App Decrypt)
 - **基于 Frida**: 内置 Frida 引擎，安全高效。
 - **一键脱壳**:
   - **Android**: 基于 `frida-dexdump`，支持从内存中 dump dex 文件。
@@ -41,6 +41,17 @@ MKTools 是一款移动端应用分析工具箱(目前仅适配了Mac系统)。�
 - **应用列表**: 自动加载设备内已安装应用列表（带图标），方便选择目标应用。
 
 <img src="docs/images/应用脱壳.png" width="800" alt="应用脱壳界面" />
+
+### 6. 🌐 API 调试 (API Debugger)
+- **请求构建器**: 支持 GET、POST、PUT、DELETE、PATCH、HEAD、OPTIONS 等全部常用 HTTP 方法。
+- **多种请求体格式**: 支持 JSON、XML、GraphQL、form-data、Binary 及无请求体模式。
+- **语法高亮编辑器**: 请求体编辑区内置 JSON / XML / GraphQL 语法高亮，基于 textarea overlay 技术，保留原生编辑体验。
+- **一键格式化**: 请求体支持格式化，自动修正常见语法错误（如多余逗号、单引号、未加引号的键名），无法修复时给出具体错误提示。
+- **响应体展示**: 响应区自动识别 JSON 内容并高亮渲染，显示状态码、耗时、响应大小；响应头以表格形式单独展示。
+- **历史记录**: 每次成功发送请求后自动保存，支持关键词搜索，点击即可恢复完整请求现场。
+- **左右分栏布局**: 请求区与响应区并排显示，参考 BurpSuite 风格，最大化可用空间。
+
+<img src="docs/images/API调试.png" width="800" alt="API调试界面" />
 
 ## 🛠️ 技术栈
 

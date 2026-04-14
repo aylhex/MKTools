@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem, net } from 'electron'
 import path from 'node:path'
 import { fixPath } from './utils/env'
 import { getDevices, getAndroidApps, getAndroidAppIcon } from './services/deviceService'
@@ -101,6 +101,19 @@ function createWindow() {
       win.setOpacity(opacity);
     }, interval);
   });
+
+  // Right-click context menu (select / copy / paste / cut)
+  win.webContents.on('context-menu', (_event, params) => {
+    const menu = new Menu()
+    if (params.isEditable) {
+      menu.append(new MenuItem({ role: 'cut', enabled: params.editFlags.canCut }))
+      menu.append(new MenuItem({ role: 'copy', enabled: params.editFlags.canCopy }))
+      menu.append(new MenuItem({ role: 'paste', enabled: params.editFlags.canPaste }))
+    } else if (params.selectionText) {
+      menu.append(new MenuItem({ role: 'copy' }))
+    }
+    if (menu.items.length > 0) menu.popup({ window: win! })
+  })
 
   // Test active push message to Renderer-process.
   win.webContents.on('did-finish-load', () => {
@@ -772,5 +785,43 @@ function setupIpcHandlers() {
     });
   })
   
+  safeHandle('http-request', (_event, args: {
+    method: string
+    url: string
+    headers: Record<string, string>
+    body?: string
+  }) => {
+    return new Promise((resolve, reject) => {
+      const request = net.request({ method: args.method, url: args.url })
+
+      for (const [key, value] of Object.entries(args.headers ?? {})) {
+        request.setHeader(key, value)
+      }
+
+      request.on('response', (response) => {
+        const resHeaders: Record<string, string> = {}
+        for (const [key, values] of Object.entries(response.headers)) {
+          resHeaders[key] = Array.isArray(values) ? values.join(', ') : String(values)
+        }
+        const chunks: Buffer[] = []
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+        response.on('end', () => {
+          resolve({
+            status: response.statusCode,
+            statusText: response.statusMessage,
+            headers: resHeaders,
+            body: Buffer.concat(chunks).toString('utf-8'),
+          })
+        })
+        response.on('error', (err: Error) => reject(err))
+      })
+
+      request.on('error', (err: Error) => reject(err))
+
+      if (args.body) request.write(args.body)
+      request.end()
+    })
+  })
+
   console.log('[IPC] All handlers setup complete');
 }

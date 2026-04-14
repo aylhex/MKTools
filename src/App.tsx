@@ -4,6 +4,7 @@ import { LogViewer } from './components/LogViewer';
 import { FileManager } from './components/FileManager';
 import { AppSigner } from './components/AppSigner';
 import { AppDecrypt } from './components/AppDecrypt';
+import { AppRequest } from './components/AppRequest';
 import { Device, LogEntry, FilterState, Theme } from './types';
 import { AlertTriangle, X, FilterX, Sun, Moon, Terminal } from 'lucide-react';
 
@@ -29,7 +30,7 @@ function App() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [theme, setTheme] = useState<Theme>('dark');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [activeTab, setActiveTab] = useState<'logs' | 'files' | 'signer' | 'decrypt'>('logs');
+  const [activeTab, setActiveTab] = useState<'logs' | 'files' | 'signer' | 'decrypt' | 'request'>('logs');
   const [isDeviceDropdownOpen, setIsDeviceDropdownOpen] = useState(false);
   
   const [filters, setFilters] = useState<FilterState>({
@@ -305,12 +306,22 @@ function App() {
             <button
               onClick={() => setActiveTab('decrypt')}
               className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${
-                activeTab === 'decrypt' 
-                  ? (theme === 'dark' ? 'bg-zinc-800 text-white shadow-sm' : 'bg-slate-100 text-slate-900 shadow-sm') 
+                activeTab === 'decrypt'
+                  ? (theme === 'dark' ? 'bg-zinc-800 text-white shadow-sm' : 'bg-slate-100 text-slate-900 shadow-sm')
                   : (theme === 'dark' ? 'text-zinc-500 hover:text-zinc-200' : 'text-slate-500 hover:text-slate-900')
               }`}
             >
               应用脱壳
+            </button>
+            <button
+              onClick={() => setActiveTab('request')}
+              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${
+                activeTab === 'request'
+                  ? (theme === 'dark' ? 'bg-zinc-800 text-white shadow-sm' : 'bg-slate-100 text-slate-900 shadow-sm')
+                  : (theme === 'dark' ? 'text-zinc-500 hover:text-zinc-200' : 'text-slate-500 hover:text-slate-900')
+              }`}
+            >
+              API调试
             </button>
           </nav>
         </div>
@@ -501,6 +512,10 @@ function App() {
             deviceId={selectedDevice}
             onError={setError}
           />
+        </div>
+
+        <div className={activeTab === 'request' ? 'h-full' : 'hidden'}>
+          <AppRequest theme={theme} />
         </div>
 
         <div className={activeTab === 'logs' ? 'flex h-full' : 'hidden'}>
