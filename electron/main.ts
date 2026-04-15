@@ -38,8 +38,8 @@ if (process.platform === 'darwin') {
     
   app.setAboutPanelOptions({
     applicationName: 'MKTools',
-    applicationVersion: '1.0.0',
-    version: '1.0.0',
+    applicationVersion: app.getVersion(),
+    version: app.getVersion(),
     copyright: 'Copyright © 2026',
     credits: 'A powerful mobile development tool',
     iconPath: iconPath

@@ -4,7 +4,7 @@
   "description": "Mobile Analysis Tool for Android and iOS",
   "author": "MKTools",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
