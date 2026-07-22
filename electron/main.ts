@@ -1,11 +1,16 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem, net } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, Menu, MenuItem } from 'electron'
 import path from 'node:path'
+import fs from 'node:fs'
+import http from 'node:http'
+import https from 'node:https'
+import { URL as NodeURL } from 'node:url'
 import { fixPath } from './utils/env'
-import { getDevices, getAndroidApps, getAndroidAppIcon } from './services/deviceService'
+import { getDevices, getAndroidApps, getAndroidAppIcon, getAndroidPackagePids, checkAndroidRoot } from './services/deviceService'
 import { startLogging, stopLogging } from './services/logService'
 import { listDirectory, downloadFile, downloadFileToTemp, deleteTarget, mkdir, upload, listIosApps, renameFile, createFile, checkJailbreak, getIosAppIcon } from './services/fileService'
 import { getKeystoreAliases, analyzeApk, resignApk, getIosIdentities, resignIpa, injectAndResignApk, decompileApkForEdit, resignFromDecompiled, cleanupDecompileSession, DecompileSession } from './services/signerService'
 import { installApp, installAppFromDevice } from './services/installService'
+import { stopAllIproxy } from './services/iosSshService'
 import { decryptApp } from './services/fridaService'
 import { getBuildToolsPath } from './utils/paths'
 import { saveIconToCache, getIconFromCache, getIconsBatch, clearIconCache, getCacheStats } from './services/iconCacheService'
@@ -143,7 +148,9 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  // Cleanup if needed
+  // 清理所有后台子进程，避免应用退出后遗留僵尸进程 / 端口占用（logcat、idevicesyslog、iproxy 等）
+  try { stopLogging(); } catch (_) {}
+  try { stopAllIproxy(); } catch (_) {}
 })
 
 app.on('activate', () => {
@@ -308,6 +315,24 @@ function setupIpcHandlers() {
       } catch (e) {
         console.error('[IPC] get-installed-apps failed:', e);
         throw e;
+      }
+    })
+
+    safeHandle('get-package-pids', async (_event, args: { deviceId: string; packageName: string }) => {
+      try {
+        return await getAndroidPackagePids(args.deviceId, args.packageName);
+      } catch (e) {
+        console.error('[IPC] get-package-pids failed:', e);
+        return [];
+      }
+    })
+
+    safeHandle('check-android-root', async (_event, args: { deviceId: string }) => {
+      try {
+        return await checkAndroidRoot(args.deviceId);
+      } catch (e) {
+        console.error('[IPC] check-android-root failed:', e);
+        return false;
       }
     })
 
@@ -663,6 +688,14 @@ function setupIpcHandlers() {
   })
 
   safeHandle('dialog-prompt', async (_event, options: { title: string, message: string, defaultValue?: string }) => {
+    // HTML 转义：防止 title/message/defaultValue（例如重命名时的现有文件名，可能含 " < > 等）
+    // 被注入到高权限（nodeIntegration）弹窗 HTML 中造成 XSS/RCE
+    const escapeHtml = (s: string) => String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
     // 创建一个简单的输入窗口
     const promptWin = new BrowserWindow({
       width: 400,
@@ -742,9 +775,9 @@ function setupIpcHandlers() {
       </head>
       <body>
         <div class="container">
-          <h3>${options.title}</h3>
-          <p>${options.message}</p>
-          <input type="text" id="input" value="${options.defaultValue || ''}" autofocus />
+          <h3>${escapeHtml(options.title)}</h3>
+          <p>${escapeHtml(options.message)}</p>
+          <input type="text" id="input" value="${escapeHtml(options.defaultValue || '')}" autofocus />
           <div class="buttons">
             <button class="cancel" onclick="cancel()">取消</button>
             <button class="ok" onclick="submit()">确定</button>
@@ -785,42 +818,109 @@ function setupIpcHandlers() {
     });
   })
   
+  // 用 Node 原生 https/http 替换 Electron net.request，支持超时 / 忽略 SSL / 二进制 body
   safeHandle('http-request', (_event, args: {
     method: string
     url: string
     headers: Record<string, string>
-    body?: string
+    body?: string                          // 文本 body 或 base64 编码后的二进制
+    bodyEncoding?: 'text' | 'base64'       // body 编码方式（默认 text）
+    timeout?: number                        // 请求超时（ms，0/未设 = 无超时）
+    rejectUnauthorized?: boolean            // false = 忽略 SSL 证书错误
   }) => {
     return new Promise((resolve, reject) => {
-      const request = net.request({ method: args.method, url: args.url })
+      let parsed: NodeURL;
+      try { parsed = new NodeURL(args.url); }
+      catch (e) { reject(new Error(`Invalid URL: ${(e as Error).message}`)); return; }
 
-      for (const [key, value] of Object.entries(args.headers ?? {})) {
-        request.setHeader(key, value)
+      const isHttps = parsed.protocol === 'https:';
+      const lib = isHttps ? https : http;
+
+      const bodyBuf = args.body
+        ? (args.bodyEncoding === 'base64' ? Buffer.from(args.body, 'base64') : Buffer.from(args.body, 'utf-8'))
+        : undefined;
+
+      // 若调用方未显式设置 Content-Length，且有 body，则自动填入（防止 chunked 有些接口不接受）
+      const headers = { ...(args.headers || {}) };
+      if (bodyBuf && !Object.keys(headers).some(k => k.toLowerCase() === 'content-length')) {
+        headers['Content-Length'] = String(bodyBuf.length);
       }
 
-      request.on('response', (response) => {
-        const resHeaders: Record<string, string> = {}
-        for (const [key, values] of Object.entries(response.headers)) {
-          resHeaders[key] = Array.isArray(values) ? values.join(', ') : String(values)
+      const req = lib.request({
+        method: args.method,
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers,
+        rejectUnauthorized: args.rejectUnauthorized !== false, // 默认严格；显式 false 才忽略
+      }, (res) => {
+        const resHeaders: Record<string, string> = {};
+        for (const [key, values] of Object.entries(res.headers)) {
+          resHeaders[key] = Array.isArray(values) ? values.join(', ') : String(values ?? '');
         }
-        const chunks: Buffer[] = []
-        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-        response.on('end', () => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
           resolve({
-            status: response.statusCode,
-            statusText: response.statusMessage,
+            status: res.statusCode ?? 0,
+            statusText: res.statusMessage ?? '',
             headers: resHeaders,
-            body: Buffer.concat(chunks).toString('utf-8'),
-          })
-        })
-        response.on('error', (err: Error) => reject(err))
-      })
+            body: buf.toString('utf-8'),
+            bodyBase64: buf.toString('base64'),  // 供响应保存到文件（二进制安全）
+          });
+        });
+        res.on('error', (err: Error) => reject(err));
+      });
 
-      request.on('error', (err: Error) => reject(err))
+      req.on('error', (err: Error) => reject(err));
 
-      if (args.body) request.write(args.body)
-      request.end()
-    })
+      if (args.timeout && args.timeout > 0) {
+        req.setTimeout(args.timeout, () => {
+          req.destroy(new Error(`Request timeout after ${args.timeout}ms`));
+        });
+      }
+
+      if (bodyBuf) req.write(bodyBuf);
+      req.end();
+    });
+  })
+
+  // 保存响应到本地文件（支持文本或 base64 二进制）
+  safeHandle('save-response-to-file', async (_event, args: {
+    defaultName?: string
+    content: string
+    encoding?: 'utf-8' | 'base64'
+  }) => {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: '保存响应到文件',
+      defaultPath: args.defaultName || `response_${Date.now()}.txt`,
+    });
+    if (canceled || !filePath) return null;
+    const buf = args.encoding === 'base64'
+      ? Buffer.from(args.content, 'base64')
+      : Buffer.from(args.content, 'utf-8');
+    await fs.promises.writeFile(filePath, buf);
+    return filePath;
+  })
+
+  // 选择要作为 binary body 上传的本地文件
+  safeHandle('select-upload-file', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      title: '选择要上传的文件',
+      properties: ['openFile'],
+    });
+    if (canceled || filePaths.length === 0) return null;
+    const p = filePaths[0];
+    const stat = await fs.promises.stat(p);
+    return { path: p, name: path.basename(p), size: stat.size };
+  })
+
+  // 读取本地文件为 base64（供 binary body 传输）
+  safeHandle('read-file-base64', async (_event, args: { path: string }) => {
+    const buf = await fs.promises.readFile(args.path);
+    return buf.toString('base64');
   })
 
   console.log('[IPC] All handlers setup complete');

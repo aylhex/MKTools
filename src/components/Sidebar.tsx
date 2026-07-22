@@ -1,6 +1,6 @@
 import React from 'react';
 import { Device, FilterState, Theme } from '../types';
-import { Play, Square, Smartphone, Trash2, Search, Hash, Tag, Filter, Apple, Smartphone as AndroidIcon, Sun, Moon, ChevronLeft, ChevronRight, Terminal, Activity } from 'lucide-react';
+import { Play, Square, Smartphone, Trash2, Search, Hash, Tag, Filter, Apple, Smartphone as AndroidIcon, Sun, Moon, ChevronLeft, ChevronRight, Terminal, Activity, Package } from 'lucide-react';
 
 interface SidebarProps {
   devices: Device[];
@@ -11,6 +11,7 @@ interface SidebarProps {
   onClearLogs: () => void;
   filters: FilterState;
   onFilterChange: (filters: FilterState) => void;
+  apps?: { bundleId: string; name: string }[];
   selectedPlatform?: 'android' | 'ios';
   theme: Theme;
   onToggleTheme: () => void;
@@ -30,6 +31,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClearLogs,
   filters,
   onFilterChange,
+  apps = [],
   selectedPlatform = 'android',
   theme,
   onToggleTheme,
@@ -200,6 +202,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
 
           <div className="group">
+            <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>Application</label>
+            <div className="relative">
+              <Package size={12} className={`absolute left-3 top-1/2 -translate-y-1/2 z-10 ${isDark ? 'text-zinc-600' : 'text-slate-400'} group-focus-within:text-blue-500 transition-colors`} />
+              <select
+                className={`w-full appearance-none ${inputBg} border ${inputBorder} rounded-lg pl-8 pr-8 py-2 text-xs ${inputText} focus:outline-none focus:border-blue-500/50 transition-all hover:border-blue-500/30 truncate`}
+                value={filters.package || ''}
+                onChange={(e) => onFilterChange({ ...filters, package: e.target.value })}
+              >
+                <option value="">All applications</option>
+                {apps.map(a => (
+                  <option key={a.bundleId} value={a.bundleId}>{a.bundleId}</option>
+                ))}
+              </select>
+              <div className={`absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none ${isDark ? 'text-zinc-500' : 'text-slate-400'}`}>
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <div className="group">
             <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>
               {selectedPlatform === 'ios' ? 'Process (Regex)' : 'Tag (Regex)'}
             </label>
@@ -215,21 +237,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           </div>
 
-          {selectedPlatform !== 'ios' && (
-            <div className="group">
-              <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>PID</label>
-              <div className="relative">
-                  <Hash size={12} className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDark ? 'text-zinc-600' : 'text-slate-400'} group-focus-within:text-blue-500 transition-colors`} />
-                  <input 
-                    type="text"
-                    className={`w-full ${inputBg} border ${inputBorder} rounded-lg pl-8 pr-3 py-2 text-xs ${inputText} ${inputPlaceholder} focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all`}
-                    placeholder="Filter by PID..."
-                    value={filters.pid}
-                    onChange={(e) => onFilterChange({...filters, pid: e.target.value})}
-                  />
-              </div>
+          <div className="group">
+            <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>PID</label>
+            <div className="relative">
+                <Hash size={12} className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDark ? 'text-zinc-600' : 'text-slate-400'} group-focus-within:text-blue-500 transition-colors`} />
+                <input
+                  type="text"
+                  className={`w-full ${inputBg} border ${inputBorder} rounded-lg pl-8 pr-3 py-2 text-xs ${inputText} ${inputPlaceholder} focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all`}
+                  placeholder="Filter by PID..."
+                  value={filters.pid}
+                  onChange={(e) => onFilterChange({...filters, pid: e.target.value})}
+                />
             </div>
-          )}
+          </div>
 
            <div className="group">
             <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>Search Message</label>

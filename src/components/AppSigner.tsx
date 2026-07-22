@@ -273,7 +273,7 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
   };
 
   return (
-    <div className={`flex h-full overflow-hidden ${isDark ? 'bg-[#1e1e20]' : 'bg-zinc-50/50'}`}>
+    <div className={`flex h-full overflow-hidden ${isDark ? 'bg-[#1F1F1F]' : 'bg-zinc-50/50'}`}>
       {/* 左侧配置面板 - 宽度保持 w-72 */}
       <div className={`w-72 flex flex-col border-r shrink-0 overflow-y-auto ${isDark ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'}`}>
         <div className="p-6 space-y-6">
@@ -462,7 +462,7 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
       {/* 右侧输出面板 - 尺寸与日志输出模块一致 */}
       <div className="flex-1 flex flex-col overflow-hidden relative">
         {/* 顶部工具栏 - OPERATION STATUS */}
-        <div className={`h-10 px-4 flex items-center justify-between border-b shrink-0 ${isDark ? 'bg-[#252529] border-zinc-700/50 text-zinc-400' : 'bg-[#e2e8f0] border-slate-300 text-slate-700'}`}>
+        <div className={`h-10 px-4 flex items-center justify-between border-b shrink-0 ${isDark ? 'bg-[#181818] border-zinc-700/50 text-zinc-400' : 'bg-[#f8f8f8] border-slate-300 text-slate-700'}`}>
           <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wider">
             <Activity size={12} className={loading ? 'text-blue-500 animate-pulse' : decompileSession ? 'text-amber-500' : ''} />
             {loading ? 'TASK IN PROGRESS' : decompileSession ? 'WAITING FOR USER' : 'OPERATION STATUS'}
@@ -473,7 +473,7 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
         <div className="flex-1 overflow-hidden relative flex flex-col">
           {!loading && logs.length === 0 && !result ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center space-y-5 opacity-30">
-              <div className={`p-6 rounded-2xl ${isDark ? 'bg-[#252529]' : 'bg-white border border-zinc-100 shadow-sm'}`}>
+              <div className={`p-6 rounded-2xl ${isDark ? 'bg-[#181818]' : 'bg-white border border-zinc-100 shadow-sm'}`}>
                 <Shield size={40} strokeWidth={1} />
               </div>
               <div className="space-y-1">
@@ -485,7 +485,7 @@ export const AppSigner: React.FC<AppSignerProps> = ({ theme, onError }) => {
             <div 
               ref={logContainerRef}
               className={`absolute inset-0 p-4 font-mono text-[11px] overflow-y-auto leading-relaxed scroll-smooth ${
-                isDark ? 'bg-[#1e1e20] text-zinc-400' : 'bg-zinc-50/30 text-zinc-600'
+                isDark ? 'bg-[#1F1F1F] text-zinc-400' : 'bg-zinc-50/30 text-zinc-600'
               }`}
             >
               {logs.map((log, i) => (

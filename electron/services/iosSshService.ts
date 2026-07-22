@@ -90,38 +90,61 @@ export function stopIproxy(deviceId: string): void {
   }
 }
 
-// 检测设备是否越狱（通过尝试 SSH 连接）
+// 停止所有 iproxy 进程（应用退出时调用，避免遗留僵尸进程 / 端口占用）
+export function stopAllIproxy(): void {
+  for (const [deviceId, proc] of iproxyProcesses) {
+    try {
+      proc.kill();
+    } catch (e) {
+      // 忽略清理时的错误
+    }
+    iproxyProcesses.delete(deviceId);
+  }
+}
+
+// 检测设备是否越狱：双探测策略
+//   1) 优先：Frida ——现代越狱推荐（palera1n/Dopamine 等），无需 SSH，能连即越狱
+//   2) 兜底：SSH  ——传统方式（OpenSSH + root 默认密码 alpine）
+// 只要任一探测成功即认为设备已越狱。
 export async function checkJailbreak(deviceId: string): Promise<boolean> {
+  console.log(`[Jailbreak Check] Starting check for device: ${deviceId}`);
+
+  // ── 方式 1：Frida 探测（脱壳实际依赖的服务，最准确）─────────────────────
+  try {
+    const { stdout } = await execPromise(`frida-ps -D "${deviceId}"`, { timeout: 8000 });
+    if (stdout && stdout.trim().length > 0) {
+      console.log(`[Jailbreak Check] ✓ Frida detected — device is jailbroken`);
+      return true;
+    }
+  } catch (fridaErr: any) {
+    // 可能原因：本机未装 frida-tools / 设备未装 Frida / 设备离线 → 尝试 SSH 兜底
+    console.log(`[Jailbreak Check] Frida probe failed (${(fridaErr.message || '').slice(0, 100)}), fallback to SSH`);
+  }
+
+  // ── 方式 2：SSH 探测（老式越狱，需 OpenSSH + 默认密码 alpine）──────────
   try {
     const sshpassPath = getSshpassPath();
     if (!sshpassPath) {
-      console.log('[Jailbreak Check] sshpass not found, cannot check jailbreak status');
+      console.log('[Jailbreak Check] sshpass not found, cannot fall back to SSH check');
       return false;
     }
-    
-    console.log(`[Jailbreak Check] Starting check for device: ${deviceId}`);
     console.log(`[Jailbreak Check] Using sshpass at: ${sshpassPath}`);
-    
-    // 启动 iproxy
+
     await startIproxy(deviceId, 2222);
     console.log(`[Jailbreak Check] iproxy started, waiting for connection to stabilize...`);
-    
-    // 额外等待 2 秒让连接稳定
     await new Promise(resolve => setTimeout(resolve, 2000));
-    
+
     console.log(`[Jailbreak Check] Attempting SSH connection...`);
-    
-    // 尝试 SSH 连接（使用默认密码 alpine）
     const { stdout } = await execPromise(
       `"${sshpassPath}" -p alpine ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p 2222 root@localhost "echo jailbroken"`,
       { timeout: 10000 }
     );
-    
+
     const result = stdout.trim() === 'jailbroken';
     console.log(`[Jailbreak Check] SSH test result: ${result}, stdout: "${stdout.trim()}"`);
     return result;
   } catch (err: any) {
-    console.log(`[Jailbreak Check] Failed - device is not jailbroken or SSH not accessible: ${err.message}`);
+    console.log(`[Jailbreak Check] SSH check failed: ${err.message}`);
     return false;
   }
 }

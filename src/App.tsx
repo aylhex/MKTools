@@ -8,6 +8,101 @@ import { AppRequest } from './components/AppRequest';
 import { Device, LogEntry, FilterState, Theme } from './types';
 import { AlertTriangle, X, FilterX, Sun, Moon, Terminal } from 'lucide-react';
 
+// 前端保留的最大日志条数（大容量环形缓冲）。
+// 配合 LogViewer 的虚拟滚动，可在保证性能的前提下支撑海量日志。
+const MAX_LOGS = 50000;
+// 单次从缓冲区取出并写入 state 的最大条数，避免一次性渲染过多。
+const MAX_DRAIN_PER_TICK = 20000;
+
+/**
+ * 容错 JSON 美化器：基于括号层级逐字符重新缩进，不依赖 JSON 是否完整。
+ * 适用于被 Android logd 截断的超大 JSON，或行首缩进被 logcat 吃掉的 JSON。
+ * 字符串内部内容（含括号/冒号/空白）通过 inStr 状态原样保留。
+ */
+function loosePrettyJson(text: string): string {
+  let out = '';
+  let indent = 0;
+  let inStr = false;
+  let esc = false;
+  const nl = () => '\n' + '  '.repeat(Math.max(0, indent));
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    switch (c) {
+      case '"':
+        inStr = true;
+        out += c;
+        break;
+      case '{':
+      case '[':
+        indent++;
+        out += c + nl();
+        break;
+      case '}':
+      case ']':
+        indent = Math.max(0, indent - 1);
+        out = out.replace(/[ \t\n]*$/, '');
+        out += nl() + c;
+        break;
+      case ',':
+        out = out.replace(/[ \t\n]*$/, '');
+        out += c + nl();
+        break;
+      case ':':
+        out = out.replace(/[ \t]*$/, '');
+        out += ': ';
+        break;
+      case ' ':
+      case '\t':
+      case '\n':
+      case '\r':
+        // 忽略结构性空白（字符串内已在 inStr 分支处理），由缩进逻辑重新生成
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+/**
+ * 美化日志消息中的 JSON：若含（或整体是）JSON 对象/数组，格式化为 2 空格缩进多行。
+ * - 完整 JSON：JSON.parse + stringify 得到标准缩进。
+ * - 被截断 / 缩进丢失的 JSON：退化为 loosePrettyJson 尽力缩进。
+ * 幂等：对已美化的 JSON 再次调用结果一致，可在多环节安全重复应用。
+ */
+function prettifyJsonInMessage(msg: string): string {
+  if (!msg || msg.length < 2) return msg;
+  const start = msg.search(/[\{\[]/);
+  if (start === -1) return msg;
+  const prefix = msg.slice(0, start);
+  const jsonPart = msg.slice(start).trim();
+  if (!(jsonPart.startsWith('{') || jsonPart.startsWith('['))) return msg;
+
+  // 1. 优先严格解析（完整 JSON → 标准美化）
+  try {
+    const obj = JSON.parse(jsonPart);
+    if (obj && typeof obj === 'object') {
+      return prefix + JSON.stringify(obj, null, 2);
+    }
+  } catch {
+    // 继续尝试容错美化
+  }
+
+  // 2. 容错美化：仅当内容确实像 JSON（含 "key": 结构）时才处理，避免破坏普通日志
+  if (/"[^"]*"\s*:/.test(jsonPart)) {
+    return prefix + loosePrettyJson(jsonPart);
+  }
+
+  return msg;
+}
+
 // 声明全局 window.ipcRenderer
 declare global {
   interface Window {
@@ -37,13 +132,53 @@ function App() {
     level: 'V',
     tag: '',
     pid: '',
-    search: ''
+    search: '',
+    package: ''
   });
+
+  // Android 应用列表（用于按包名过滤下拉）
+  const [apps, setApps] = useState<{ bundleId: string; name: string }[]>([]);
+  // 当前包名对应的运行进程 PID 集合（定时刷新以应对进程重启）
+  const [packagePids, setPackagePids] = useState<Set<number>>(new Set());
 
   const selectedPlatform = useMemo(() => {
     const device = devices.find(d => d.id === selectedDevice);
     return device?.platform || 'android';
   }, [devices, selectedDevice]);
+
+  // 选中设备（Android / iOS 均适用）后获取已安装应用列表，用于按应用过滤下拉
+  useEffect(() => {
+    if (!selectedDevice) {
+      setApps([]);
+      return;
+    }
+    let active = true;
+    window.ipcRenderer.invoke('get-installed-apps', { deviceId: selectedDevice, platform: selectedPlatform })
+      .then((list: { bundleId: string; name: string }[]) => { if (active) setApps(list || []); })
+      .catch(() => { if (active) setApps([]); });
+    return () => { active = false; };
+  }, [selectedDevice, selectedPlatform]);
+
+  // 按包名过滤时，定时刷新该应用的运行进程 PID 集合（应对进程重启导致的 PID 变化）
+  useEffect(() => {
+    const pkg = (filters.package || '').trim();
+    if (!pkg || selectedPlatform !== 'android' || !selectedDevice) {
+      setPackagePids(new Set());
+      return;
+    }
+    let active = true;
+    const refresh = async () => {
+      try {
+        const pids: number[] = await window.ipcRenderer.invoke('get-package-pids', { deviceId: selectedDevice, packageName: pkg });
+        if (active) setPackagePids(new Set(pids));
+      } catch {
+        // ignore
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 2000);
+    return () => { active = false; clearInterval(timer); };
+  }, [filters.package, selectedDevice, selectedPlatform]);
 
 
 
@@ -147,6 +282,12 @@ function App() {
         // 恢复 Ref 缓冲机制，这是处理高频数据的唯一正确方式
         if (!isLoggingRef.current) return;
         if (logs && logs.length > 0) {
+             // 前端做一次 JSON 美化：让日志中的 JSON（含被 logd 截断的超大 JSON）
+             // 以缩进多行形式展示。与后端美化幂等，重复无副作用。
+             // 放前端可通过 renderer HMR 立即生效，无需重启 electron 主进程。
+             for (const l of logs) {
+               l.msg = prettifyJsonInMessage(l.msg);
+             }
              logBufferRef.current.push(...logs);
         }
       });
@@ -160,16 +301,15 @@ function App() {
     // 恢复定时器
     const intervalId = setInterval(() => {
       if (logBufferRef.current.length > 0) {
-        // 使用 slice 限制单次更新数量，防止一次性渲染太多导致黑屏
-        const logsToProcess = logBufferRef.current.splice(0, 2000); 
-        
+        // 限制单次写入 state 的数量，避免一次性处理过多；剩余部分下个 tick 继续
+        const logsToProcess = logBufferRef.current.splice(0, MAX_DRAIN_PER_TICK);
+
         setLogs(prevLogs => {
-          const newLogs = [...prevLogs, ...logsToProcess];
-          
-          // 限制最大日志条数，防止内存溢出
-          // 提升到 1000 条，配合基础渲染
-          if (newLogs.length > 1000) {
-            return newLogs.slice(newLogs.length - 1000);
+          const newLogs = prevLogs.length === 0 ? logsToProcess : [...prevLogs, ...logsToProcess];
+
+          // 环形缓冲：超过上限时丢弃最早的日志，防止内存无限增长
+          if (newLogs.length > MAX_LOGS) {
+            return newLogs.slice(newLogs.length - MAX_LOGS);
           }
           return newLogs;
         });
@@ -218,8 +358,10 @@ function App() {
     const normalizedTag = tag.trim();
     const normalizedPid = pid.trim();
     const normalizedSearch = search.trim();
+    // 级别按严重程度从低到高排序，用于实现「该级别及以上」的过滤语义（与 Android Studio Logcat 一致）
     const levels = ['V', 'D', 'I', 'W', 'E', 'F'];
     const selectedLevel = level.toUpperCase();
+    const selectedLevelIndex = levels.indexOf(selectedLevel);
 
     let tagRegex: RegExp | null = null;
     if (normalizedTag) {
@@ -240,13 +382,28 @@ function App() {
     }
 
     return logs.filter(log => {
-      // Level filter
+      // Level filter：显示「所选级别及更高级别」的日志（例如选 Warn 会显示 W/E/F）
       const logLevel = (log.level || '').toUpperCase().trim();
-      if (!levels.includes(logLevel)) return false;
-      if (selectedLevel !== 'V' && logLevel !== selectedLevel) return false;
+      const logLevelIndex = levels.indexOf(logLevel);
+      if (logLevelIndex === -1) return false;
+      if (selectedLevelIndex > 0 && logLevelIndex < selectedLevelIndex) return false;
       
       // PID filter
       if (normalizedPid && log.pid.toString() !== normalizedPid) return false;
+
+      // Package/Application filter
+      const pkg = (filters.package || '').trim();
+      if (pkg) {
+        if (selectedPlatform === 'android') {
+          // Android：日志本身不含包名，用「包名 → PID 集合」映射匹配
+          if (!packagePids.has(log.pid)) return false;
+        } else {
+          // iOS：日志的 tag 就是 process 名（可能是 App 可执行名或 bundleId），
+          // 用宽松包含匹配（不区分大小写），能同时命中 name / bundleId 及其变体
+          const t = (log.tag || '').toLowerCase();
+          if (!t.includes(pkg.toLowerCase())) return false;
+        }
+      }
 
       // Tag filter
       if (tagRegex && !tagRegex.test(log.tag)) return false;
@@ -258,7 +415,7 @@ function App() {
 
       return true;
     });
-  }, [logs, filters, selectedPlatform]);
+  }, [logs, filters, selectedPlatform, packagePids]);
 
   return (
     <div className={`flex flex-col h-screen w-screen overflow-hidden ${theme === 'dark' ? 'bg-zinc-950 text-zinc-200' : 'bg-slate-50 text-slate-900'}`}>
@@ -519,7 +676,7 @@ function App() {
         </div>
 
         <div className={activeTab === 'logs' ? 'flex h-full' : 'hidden'}>
-          <Sidebar 
+          <Sidebar
             devices={devices}
             selectedDevice={selectedDevice}
             onSelectDevice={handleSelectDevice}
@@ -528,6 +685,7 @@ function App() {
             onClearLogs={handleClearLogs}
             filters={filters}
             onFilterChange={setFilters}
+            apps={apps}
             selectedPlatform={selectedPlatform}
             theme={theme}
             onToggleTheme={() => setTheme(prev => prev === 'dark' ? 'light' : 'dark')}
@@ -551,8 +709,8 @@ function App() {
                       <h3 className="font-bold text-sm">无匹配结果</h3>
                       <p className={`text-xs mt-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-slate-500'}`}>请调整过滤条件以查看更多日志</p>
                     </div>
-                    <button 
-                      onClick={() => setFilters({ level: 'V', tag: '', pid: '', search: '' })}
+                    <button
+                      onClick={() => setFilters({ level: 'V', tag: '', pid: '', search: '', package: '' })}
                       className="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all pointer-events-auto active:scale-95"
                     >
                       重置所有过滤器
@@ -574,6 +732,7 @@ function App() {
                 onClearLogs={handleClearLogs}
                 hasSelectedDevice={!!selectedDevice}
                 isLogging={isLogging}
+                highlight={filters.search}
               />
             </div>
           </div>

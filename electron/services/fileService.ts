@@ -371,47 +371,104 @@ interface FileEntry {
   resolvedPath?: string;
 }
 
+// 解码 GNU/toybox `ls -b` 输出的转义序列（\ooo 八进制、\n \t \\ \空格 等），
+// 还原文件名的原始字节并按 UTF-8 解析，用于修复非 ASCII 文件名（如中文）显示为 "???" 的问题
+function decodeLsName(name: string): string {
+  if (!name.includes('\\')) return name; // 无转义（locale 直接输出了 raw UTF-8），原样返回
+  const bytes: number[] = [];
+  for (let i = 0; i < name.length; i++) {
+    const ch = name[i];
+    if (ch === '\\' && i + 1 < name.length) {
+      const next = name[i + 1];
+      if (next >= '0' && next <= '7') {
+        // \ooo 三位八进制
+        const oct = name.slice(i + 1, i + 4);
+        bytes.push(parseInt(oct, 8) & 0xff);
+        i += 3;
+        continue;
+      }
+      const simple: Record<string, number> = {
+        n: 0x0a, t: 0x09, r: 0x0d, '\\': 0x5c, '"': 0x22,
+        "'": 0x27, ' ': 0x20, a: 0x07, b: 0x08, f: 0x0c, v: 0x0b,
+      };
+      if (next in simple) {
+        bytes.push(simple[next]);
+        i += 1;
+        continue;
+      }
+      bytes.push(next.charCodeAt(0));
+      i += 1;
+      continue;
+    }
+    const code = name.charCodeAt(i);
+    if (code < 128) {
+      bytes.push(code);
+    } else {
+      // 已是 raw UTF-8 字符，按 UTF-8 重新编码为字节
+      for (const bt of Buffer.from(ch, 'utf-8')) bytes.push(bt);
+    }
+  }
+  return Buffer.from(bytes).toString('utf-8');
+}
+
 function parseLsLine(line: string): FileEntry | null {
   const raw = line.trim();
   if (!raw || raw.startsWith('total')) return null;
   const parts = raw.split(/\s+/);
-  if (parts.length < 4) return null;
+  if (parts.length < 2) return null;
+
   const perms = parts[0] || '';
+  // 校验首列像权限串：首字符是文件类型(dlbcps-)，且长度足够（正常 10 位，可能带 +/. 后缀）
+  // 兼容 stat 失败时的形式，如 "d?????????"
+  if (perms.length < 10 || !/^[dlbcps-]/.test(perms)) return null;
   const isDir = perms.startsWith('d');
+
+  // 文件名 / 符号链接目标提取
+  // 关键：因为使用了 ls -b，真实文件名内的空格会被转义为 "\ "，故文件名不含裸空格，
+  // 必定是行尾的单个 token（符号链接则位于 " -> " 之前）。
+  // 这样即使元数据字段因无 stat 权限而显示为 "?"（如受保护的系统目录 metadata/data_mirror），
+  // 也能稳定地提取到正确的文件名，而不会把 "?" 字段误拼进名字。
+  let name = '';
+  let linkTarget: string | undefined = undefined;
+  const arrowIdx = parts.indexOf('->');
+  if (arrowIdx > 0) {
+    name = parts[arrowIdx - 1] || '';
+    const target = parts.slice(arrowIdx + 1).join(' ').trim();
+    // 目标为 "?" 表示元数据不可读，视为无有效目标
+    linkTarget = target && target !== '?' ? target : undefined;
+  } else {
+    name = parts[parts.length - 1] || '';
+  }
+
+  // 日期时间（正常行存在；stat 失败行为 "?"，则留空）
   let dateIdx = -1;
+  let mtime = '';
   for (let i = 0; i < parts.length; i++) {
-    if (/^\d{4}-\d{2}-\d{2}$/.test(parts[i]) && i + 1 < parts.length && /^\d{2}:\d{2}$/.test(parts[i + 1])) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(parts[i]) && i + 1 < parts.length && /^\d{2}:\d{2}(:\d{2})?$/.test(parts[i + 1])) {
       dateIdx = i;
+      mtime = `${parts[i]} ${parts[i + 1]}`;
       break;
     }
   }
-  let mtime = '';
+
+  // 大小（正常行位于日期前一列；stat 失败行无法获取，置 0）
   let size = 0;
-  let name = '';
-  if (dateIdx !== -1) {
-    mtime = `${parts[dateIdx]} ${parts[dateIdx + 1]}`;
-    const sizeToken = parts[dateIdx - 1];
-    size = parseInt(sizeToken, 10);
-    name = parts.slice(dateIdx + 2).join(' ');
-  } else {
-    name = parts.slice(3).join(' ');
-    const s = parts.find(p => /^\d+$/.test(p));
-    size = s ? parseInt(s, 10) : 0;
+  if (dateIdx > 0) {
+    const parsed = parseInt(parts[dateIdx - 1], 10);
+    if (!isNaN(parsed)) size = parsed;
   }
-  
+
   // 只过滤掉 . 当前目录，保留 .. 父目录
   if (name === '.') return null;
-  
-  let linkTarget: string | undefined = undefined;
-  if (name.includes('->')) {
-    const segs = name.split('->');
-    name = segs[0].trim();
-    linkTarget = segs[1]?.trim();
-  }
+
+  // 还原 ls -b 转义序列，得到真实文件名
+  name = decodeLsName(name);
+  if (linkTarget) linkTarget = decodeLsName(linkTarget);
+
   return {
     name,
     isDir,
-    size: isNaN(size) ? 0 : size,
+    size,
     mtime,
     permissions: perms,
     linkTarget
@@ -430,18 +487,27 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
   
   if (platform === 'android') {
     const adb = getAdbPath();
-    
+
+    // 修复非 ASCII 文件名（如中文）被输出为 "???" 的乱码问题：
+    // toybox ls 没有 GNU 的 -N/raw 选项，且默认会把非图形字符替换为 "?"。
+    // 方案：强制 LANG=C 使所有非 ASCII 字节都被视为"非图形字符"，
+    // 再用 ls -b 将其输出为 \ooo 八进制转义（纯 ASCII，可无损传输），
+    // 最后由 parseLsLine 中的 decodeLsName 还原为真实 UTF-8 文件名。
+    const LANG_PREFIX = 'LANG=C LC_ALL=C';
+    // shell 安全引号转义：用单引号包裹字符串，并转义内部单引号
+    const q = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
+
     // 首先检查目标路径是否是符号链接，如果是则解析到最终路径
     let actualDir = dir;
     try {
       let resolvedOut: string;
       try {
-        const r = await execPromise(`"${adb}" -s "${deviceId}" shell "readlink -f '${dir}' 2>/dev/null"`);
+        const r = await execPromise(`"${adb}" -s "${deviceId}" shell "${LANG_PREFIX} readlink -f ${q(dir)} 2>/dev/null"`);
         resolvedOut = r.stdout;
       } catch {
         // 尝试用 su 提权
         try {
-          const r = await execPromise(`"${adb}" -s "${deviceId}" shell 'su -c "readlink -f ${dir} 2>/dev/null"'`);
+          const r = await execPromise(`"${adb}" -s "${deviceId}" shell 'su -c "${LANG_PREFIX} readlink -f ${dir} 2>/dev/null"'`);
           resolvedOut = r.stdout;
         } catch {
           resolvedOut = '';
@@ -457,7 +523,7 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
     
     let stdout: string;
     try {
-      const result = await execPromise(`"${adb}" -s "${deviceId}" shell ls -la "${actualDir}"`);
+      const result = await execPromise(`"${adb}" -s "${deviceId}" shell "${LANG_PREFIX} ls -lab ${q(actualDir)}"`);
       stdout = result.stdout;
     } catch (err: any) {
       // ls 以非零退出码退出，但 stdout 可能仍有部分内容（如 /proc 下损坏的符号链接）
@@ -468,9 +534,9 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
         let rootStdout: string | null = null;
         const suAttempts = [
           // 方式1: su 0 不用 -c，直接跟命令（部分实现支持）
-          `"${adb}" -s "${deviceId}" shell su 0 ls -la "${actualDir}"`,
+          `"${adb}" -s "${deviceId}" shell "${LANG_PREFIX} su 0 ls -lab ${q(actualDir)}"`,
           // 方式2: 单引号包裹整个远端命令，保证 -c 拿到完整参数
-          `"${adb}" -s "${deviceId}" shell 'su -c "ls -la ${actualDir}"'`,
+          `"${adb}" -s "${deviceId}" shell 'su -c "${LANG_PREFIX} ls -lab ${actualDir}"'`,
           // 方式3: adb root 重启 adbd（仅限 debug 版系统）
           null,
         ];
@@ -481,7 +547,7 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
             try {
               await execPromise(`"${adb}" -s "${deviceId}" root`);
               await new Promise(r => setTimeout(r, 1500));
-              const r = await execPromise(`"${adb}" -s "${deviceId}" shell ls -la "${actualDir}"`);
+              const r = await execPromise(`"${adb}" -s "${deviceId}" shell "${LANG_PREFIX} ls -lab ${q(actualDir)}"`);
               rootStdout = r.stdout;
               break;
             } catch { continue; }
@@ -561,7 +627,7 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
         }).join('; ');
         
         try {
-          const { stdout: batchResult } = await execPromise(`"${adb}" -s "${deviceId}" shell '${commands}'`);
+          const { stdout: batchResult } = await execPromise(`"${adb}" -s "${deviceId}" shell '${LANG_PREFIX} ${commands}'`);
           const results = batchResult.trim().split('\n');
           
           for (const line of results) {
@@ -588,7 +654,7 @@ export async function listDirectory(args: ListArgs, skipSymlinkResolution: boole
           const resolvePromises = batch.map(async ({ entry, targetPath }) => {
             try {
               const { stdout: result } = await execPromise(
-                `"${adb}" -s "${deviceId}" shell "resolved=$(readlink -f '${targetPath}' 2>/dev/null || echo '${targetPath}'); echo \\"$resolved\\"; [ -d \\"$resolved\\" ] && echo 'dir' || echo 'file'"`
+                `"${adb}" -s "${deviceId}" shell "${LANG_PREFIX} resolved=$(readlink -f '${targetPath}' 2>/dev/null || echo '${targetPath}'); echo \\"$resolved\\"; [ -d \\"$resolved\\" ] && echo 'dir' || echo 'file'"`
               );
               const lines = result.trim().split('\n');
               const resolvedPath = lines[0]?.trim();

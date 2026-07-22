@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Theme, AppInfo, Device } from '../types';
-import { Terminal, Download, X, Box, AlertTriangle } from 'lucide-react';
+import { Terminal, Download, X, Box, AlertTriangle, Lock } from 'lucide-react';
 
 interface AppDecryptProps {
   theme: Theme;
@@ -21,13 +21,40 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
   const [outputPath, setOutputPath] = useState<string>(''); // 自定义输出路径
   const logContainerRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  // 设备权限检测状态：checking=检测中 / privileged=已 root|越狱 / unprivileged=未 root|越狱 / unknown=未选设备
+  const [deviceStatus, setDeviceStatus] = useState<'checking' | 'privileged' | 'unprivileged' | 'unknown'>('unknown');
+  // 手动 override：用户确认设备已越狱/Root 但自动检测过不了时的兜底
+  const [manualOverride, setManualOverride] = useState(false);
 
   const isDark = theme === 'dark';
+  const privilegeLabel = initialPlatform === 'ios' ? '越狱' : 'Root';
+  // 生效的权限状态：手动 override 优先于自动检测
+  const effectiveStatus: typeof deviceStatus = manualOverride ? 'privileged' : deviceStatus;
 
   // Sync platform with prop
   useEffect(() => {
     setPlatform(initialPlatform);
   }, [initialPlatform]);
+
+  // 检测设备是否已 root（Android）/ 越狱（iOS）——脱壳的必要条件
+  useEffect(() => {
+    // 切换设备时重置手动 override，防止把 A 设备的确认套用到 B 设备
+    setManualOverride(false);
+    if (!deviceId) { setDeviceStatus('unknown'); return; }
+    let active = true;
+    setDeviceStatus('checking');
+    (async () => {
+      try {
+        const isPrivileged: boolean = initialPlatform === 'ios'
+          ? await window.ipcRenderer.invoke('check-jailbreak', { deviceId })
+          : await window.ipcRenderer.invoke('check-android-root', { deviceId });
+        if (active) setDeviceStatus(isPrivileged ? 'privileged' : 'unprivileged');
+      } catch {
+        if (active) setDeviceStatus('unprivileged');
+      }
+    })();
+    return () => { active = false; };
+  }, [deviceId, initialPlatform]);
 
   // Fetch apps
   useEffect(() => {
@@ -269,6 +296,10 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
   }, []);
 
   const handleAppClick = (app: AppInfo) => {
+    if (effectiveStatus === 'unprivileged') {
+      onError(`当前设备${initialPlatform === 'ios' ? '未越狱' : '未 Root'}，无法进行脱壳操作。请连接已${privilegeLabel}的设备后重试。`);
+      return;
+    }
     setSelectedApp(app);
     setShowModal(true);
   };
@@ -379,7 +410,7 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
   const inputClass = `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-zinc-950 border-zinc-800 text-zinc-200 focus:border-blue-500/50' : 'bg-white border-zinc-200 text-zinc-900 shadow-sm focus:border-blue-500'} focus:outline-none transition-all focus:ring-4 focus:ring-blue-500/10`;
 
   return (
-    <div className={`flex h-full overflow-hidden ${isDark ? 'bg-[#1e1e20]' : 'bg-zinc-50/50'}`}>
+    <div className={`flex h-full overflow-hidden ${isDark ? 'bg-[#1F1F1F]' : 'bg-zinc-50/50'}`}>
       {/* Left Panel - App List */}
       <div className={`w-72 flex flex-col border-r shrink-0 overflow-hidden ${isDark ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'}`}>
         {/* Device Status Bar */}
@@ -435,8 +466,8 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
           </button>
         </div>
 
-        {/* App List */}
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+        {/* App List —— 未 privileged 时半透明禁用；顶部大 banner 已改到右侧 Console Output 区展示 */}
+        <div className={`flex-1 overflow-y-auto p-2 space-y-1 ${effectiveStatus === 'unprivileged' ? 'opacity-50 pointer-events-none' : ''}`}>
           {isFetchingApps ? (
             <div className={`h-full flex flex-col items-center justify-center gap-3 ${isDark ? 'text-zinc-500' : 'text-zinc-400'}`}>
               <div className="w-5 h-5 rounded-full border-2 border-current border-t-transparent animate-spin" />
@@ -480,7 +511,7 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
 
       {/* Right Panel - Logs */}
       <div className="flex-1 flex flex-col min-w-0">
-        <div className={`h-10 border-b flex items-center px-4 justify-between shrink-0 ${isDark ? 'bg-[#252529] border-zinc-700/50' : 'bg-[#e2e8f0] border-slate-300'}`}>
+        <div className={`h-10 border-b flex items-center px-4 justify-between shrink-0 ${isDark ? 'bg-[#181818] border-zinc-700/50' : 'bg-[#f8f8f8] border-slate-300'}`}>
           <div className="flex items-center gap-2">
             <Terminal size={12} className={isDark ? 'text-zinc-400' : 'text-slate-700'} />
             <span className={`text-[11px] font-medium uppercase tracking-wider ${isDark ? 'text-zinc-400' : 'text-slate-700'}`}>
@@ -501,13 +532,60 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
         
         <div
           ref={logContainerRef}
-          className={`flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1 select-text ${isDark ? 'bg-[#1e1e20] text-zinc-300' : 'bg-zinc-50 text-zinc-700'}`}
+          className={`flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1 select-text ${isDark ? 'bg-[#1F1F1F] text-zinc-300' : 'bg-zinc-50 text-zinc-700'}`}
           onContextMenu={handleLogContextMenu}
         >
-          {logs.length === 0 ? (
+          {effectiveStatus === 'unprivileged' ? (
+            // 未 Root/越狱 → 与文件管理「无权限访问目录」保持一致的紧凑琥珀色提示
+            <div className="h-full flex flex-col items-center justify-center gap-5 px-8 animate-in fade-in zoom-in-95 duration-500">
+              <div className={`p-8 rounded-3xl ${isDark ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-amber-50 border border-amber-200 shadow-sm'}`}>
+                <Lock size={48} strokeWidth={1.2} className={isDark ? 'text-amber-400' : 'text-amber-600'} />
+              </div>
+              <div className="space-y-2 text-center max-w-lg">
+                <p className={`text-sm font-bold ${isDark ? 'text-amber-300' : 'text-amber-700'}`}>
+                  设备无法脱壳
+                </p>
+                <p className={`text-xs font-medium leading-relaxed text-pretty ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
+                  当前 <span className="whitespace-nowrap">{initialPlatform === 'ios' ? 'iOS' : 'Android'} 设备</span>未检测到{privilegeLabel}环境，脱壳操作依赖
+                  {initialPlatform === 'ios'
+                    ? <> <span className="whitespace-nowrap">越狱环境与 Frida</span></>
+                    : <> <span className="whitespace-nowrap">Root 权限</span>与 <span className="whitespace-nowrap">frida-server</span></>
+                  }才能进行。
+                </p>
+                <p className={`text-[10px] mt-4 text-pretty ${isDark ? 'text-zinc-500' : 'text-slate-500'}`}>
+                  请连接一台已{privilegeLabel}的 {initialPlatform === 'ios' ? 'iOS' : 'Android'} 设备后重试
+                </p>
+              </div>
+
+              {/* 手动 override：若用户确认设备已越狱/Root 但自动检测不通过（如未装 frida-tools），允许强制继续 */}
+              <div className="flex flex-col items-center gap-2 mt-2 max-w-md">
+                <button
+                  onClick={() => setManualOverride(true)}
+                  className={`px-4 py-2 text-xs font-medium rounded-lg border transition-all ${
+                    isDark
+                      ? 'border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 hover:bg-zinc-800'
+                      : 'border-slate-300 text-slate-600 hover:text-slate-800 hover:border-slate-400 hover:bg-slate-50'
+                  }`}
+                >
+                  我已确认设备已{privilegeLabel}，跳过检测继续
+                </button>
+                <p className={`text-[10px] text-center text-pretty ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>
+                  自动检测依赖 <code className="font-mono">frida-ps</code> / SSH；若两者都未安装但设备实际已{privilegeLabel}，可点击强制继续
+                </p>
+              </div>
+            </div>
+          ) : effectiveStatus === 'checking' && logs.length === 0 ? (
+            <div className={`h-full flex flex-col items-center justify-center gap-3 ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>
+              <div className="w-10 h-10 rounded-full border-4 border-current border-t-transparent animate-spin opacity-70" />
+              <span className="text-xs font-medium">正在检测设备{privilegeLabel}状态...</span>
+            </div>
+          ) : logs.length === 0 ? (
             <div className={`h-full flex flex-col items-center justify-center opacity-30 gap-2 ${isDark ? 'text-zinc-500' : 'text-zinc-400'}`}>
               <Terminal size={32} />
               <span>Ready to decrypt</span>
+              {effectiveStatus === 'privileged' && (
+                <span className={`text-[10px] mt-1 ${isDark ? 'text-emerald-500' : 'text-emerald-600'}`}>设备已{privilegeLabel}，选择应用开始脱壳</span>
+              )}
             </div>
           ) : (
             logs.map((log, i) => (
@@ -576,8 +654,21 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
                 </div>
               </div>
 
-              {/* Frida Status Warning */}
-              {fridaStatus !== 'ready' && (
+              {/* Device Privilege Warning（Root/Jailbreak）—— 比 Frida 更根本的前置条件 */}
+              {effectiveStatus === 'unprivileged' && (
+                <div className={`p-3 rounded-lg text-xs flex items-start gap-2 border-2 ${
+                  isDark ? 'bg-red-500/10 text-red-400 border-red-500/30' : 'bg-red-50 text-red-700 border-red-300'
+                }`}>
+                  <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold mb-1">设备未{privilegeLabel}，无法脱壳</div>
+                    <div className="opacity-90">请连接已{privilegeLabel}的{initialPlatform === 'ios' ? 'iOS' : 'Android'}设备后重试。</div>
+                  </div>
+                </div>
+              )}
+
+              {/* Frida Status Warning（仅在已 privileged 时才有意义） */}
+              {effectiveStatus === 'privileged' && fridaStatus !== 'ready' && (
                 <div className={`p-3 rounded-lg text-xs flex items-start gap-2 ${
                   isDark ? 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20' : 'bg-yellow-50 text-yellow-700 border border-yellow-200'
                 }`}>
@@ -585,7 +676,7 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
                   <div>
                     <div className="font-bold mb-1">Frida 未就绪</div>
                     <div className="opacity-80">
-                      {fridaStatus === 'checking' ? '正在检查 Frida 服务...' : 
+                      {fridaStatus === 'checking' ? '正在检查 Frida 服务...' :
                        fridaStatus === 'error' ? 'Frida 服务连接失败，脱壳功能可能无法使用' :
                        '未检测到 Frida 服务'}
                     </div>
@@ -657,15 +748,18 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
               
               <button
                 onClick={handleDecrypt}
-                disabled={isDecrypting || fridaStatus !== 'ready'}
+                disabled={isDecrypting || fridaStatus !== 'ready' || effectiveStatus !== 'privileged'}
+                title={effectiveStatus === 'unprivileged' ? `设备未${privilegeLabel}，无法脱壳` : undefined}
                 className={`w-full py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition-all active:scale-[0.98] ${
-                  isDecrypting || fridaStatus !== 'ready'
-                    ? 'bg-blue-600/50 cursor-not-allowed' 
+                  isDecrypting || fridaStatus !== 'ready' || effectiveStatus !== 'privileged'
+                    ? 'bg-blue-600/50 cursor-not-allowed'
                     : 'bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-600/20'
                 } text-white`}
               >
                 {isDecrypting ? (
                   <>处理中...</>
+                ) : effectiveStatus === 'unprivileged' ? (
+                  <>需要{privilegeLabel}设备</>
                 ) : (
                   <>
                     <Download size={18} />

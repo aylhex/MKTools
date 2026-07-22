@@ -397,7 +397,7 @@ import base64
 
 try:
     # 连接设备
-    device = frida.get_device("${deviceId}")
+    device = frida.get_device(${JSON.stringify(deviceId)})
     print(f"[Frida] Connected to device: {device.name}", file=sys.stderr)
     
     # 枚举应用 (scope='full' 包含图标)
@@ -1547,7 +1547,7 @@ async function decryptAndroidApp(
   // 1. 强制杀死目标应用所有相关进程，确保从干净状态 spawn
   onLog(`[Android] 强制停止 ${bundleId}...`);
   try {
-    await execPromise(`"${adb}" -s "${deviceId}" shell "am force-stop ${bundleId}"`);
+    await execPromise(`"${adb}" -s "${deviceId}" shell "am force-stop '${bundleId}'"`);
     onLog(`[Android] 应用已停止`);
   } catch (e: any) {
     onLog(`[Android Warn] 停止应用失败: ${e.message}`);
@@ -1557,7 +1557,7 @@ async function decryptAndroidApp(
 
   // 确认进程已全部退出
   try {
-    const { stdout: psOut } = await execPromise(`"${adb}" -s "${deviceId}" shell "ps -A | grep ${bundleId}"`);
+    const { stdout: psOut } = await execPromise(`"${adb}" -s "${deviceId}" shell "ps -A | grep '${bundleId}'"`);
     if (psOut.trim()) {
       onLog(`[Android] 仍有残留进程，等待退出...`);
       await new Promise(r => setTimeout(r, 2000));
@@ -1650,8 +1650,8 @@ import subprocess
 import time
 
 OUTPUT_DIR = r"""${appOutputDir}"""
-DEVICE_ID  = "${deviceId}"
-BUNDLE_ID  = "${bundleId}"
+DEVICE_ID  = ${JSON.stringify(deviceId)}
+BUNDLE_ID  = ${JSON.stringify(bundleId)}
 ADB        = r"""${adb}"""
 
 
@@ -1904,7 +1904,7 @@ async function basicAndroidDecrypt(
   try {
     // 1. 获取 APK 路径
     onLog('[Android] 获取 APK 路径...');
-    const { stdout: pathOut } = await execPromise(`"${adb}" -s "${deviceId}" shell pm path ${bundleId}`);
+    const { stdout: pathOut } = await execPromise(`"${adb}" -s "${deviceId}" shell pm path '${bundleId}'`);
     const apkPath = pathOut.trim().replace(/^package:/, '');
     
     if (!apkPath) {

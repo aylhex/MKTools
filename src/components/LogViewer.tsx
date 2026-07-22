@@ -1,4 +1,6 @@
-import React, { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
+import { VariableSizeList as List, ListChildComponentProps } from 'react-window';
+import AutoSizer from 'react-virtualized-auto-sizer';
 import { LogEntry, Theme } from '../types';
 import { clsx } from 'clsx';
 import { format } from 'date-fns';
@@ -14,7 +16,22 @@ interface LogViewerProps {
   onClearLogs?: () => void;
   hasSelectedDevice?: boolean;
   isLogging?: boolean;
+  highlight?: string;
 }
+
+// 单行文本高度（px）。为支持多行日志（JSON/堆栈）按行数完整展开，采用可变行高。
+const LINE_HEIGHT = 18;
+const ROW_VPAD = 4; // 行上下内边距合计
+// 统计消息占用的物理行数（按 \n 计），用于计算该条日志的显示高度
+const getLineCount = (msg: string): number => {
+  if (!msg) return 1;
+  let n = 1;
+  for (let i = 0; i < msg.length; i++) {
+    if (msg[i] === '\n') n++;
+  }
+  return n;
+};
+const getItemSize = (msg: string): number => getLineCount(msg) * LINE_HEIGHT + ROW_VPAD;
 
 const getLevelColor = (level: string, theme: Theme) => {
   const isDark = theme === 'dark';
@@ -73,20 +90,151 @@ const getIosTypeLabel = (level: string) => {
   }
 };
 
-// 紧急回退：使用最基础的列表渲染，不依赖任何第三方虚拟滚动库
-// 以排除 react-virtuoso 导致的布局或渲染崩溃问题
-export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll, onToggleAutoScroll, platform = 'android', theme, onClearLogs, hasSelectedDevice = false, isLogging = false }) => {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const isAutoScrolling = useRef(false);
-  const userScrolledAway = useRef(false); // 新增：追踪用户是否主动滚动离开底部
-  const frozenLogs = useRef<LogEntry[]>([]); // 暂停时冻结的日志
+const formatTime = (timestamp: string) => {
+  return timestamp && !isNaN(new Date(timestamp).getTime())
+    ? format(new Date(timestamp), 'HH:mm:ss.SSS')
+    : timestamp;
+};
+
+// 将文本中匹配 keyword 的部分高亮显示（keyword 支持正则，非法则退化为纯文本匹配）
+const renderHighlighted = (text: string, keyword: string, isDark: boolean): React.ReactNode => {
+  const kw = keyword?.trim();
+  if (!kw) return text;
+
+  let regex: RegExp;
+  try {
+    regex = new RegExp(kw, 'gi');
+  } catch {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    regex = new RegExp(escaped, 'gi');
+  }
+
+  const nodes: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  const markClass = isDark ? 'bg-yellow-500/40 text-inherit rounded-[2px]' : 'bg-yellow-300/70 text-inherit rounded-[2px]';
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    nodes.push(<mark key={key++} className={markClass}>{match[0]}</mark>);
+    lastIndex = match.index + match[0].length;
+    // 防止空匹配导致死循环
+    if (match.index === regex.lastIndex) regex.lastIndex++;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes.length > 0 ? nodes : text;
+};
+
+// 格式化日志为文本（用于复制/导出）
+const formatLogAsText = (log: LogEntry, platform: 'android' | 'ios'): string => {
+  const time = formatTime(log.timestamp);
+  if (platform === 'ios') {
+    return `[${getIosTypeLabel(log.level)}] ${time} ${log.tag}: ${log.msg}`;
+  }
+  return `${time} ${log.pid} ${log.tid} ${log.level} ${log.tag}: ${log.msg}`;
+};
+
+interface ColWidths {
+  time: number;
+  pid: number;
+  tid: number;
+  level: number;
+  tag: number;
+}
+
+interface RowData {
+  logs: LogEntry[];
+  selectedIds: Set<number>;
+  colWidths: ColWidths;
+  theme: Theme;
+  isDark: boolean;
+  platform: 'android' | 'ios';
+  highlight: string;
+  onRowClick: (index: number, e: React.MouseEvent) => void;
+  onRowContextMenu: (e: React.MouseEvent, index: number) => void;
+}
+
+// 单行日志（虚拟滚动的行渲染单元）
+const LogRow: React.FC<ListChildComponentProps<RowData>> = ({ index, style, data }) => {
+  const { logs, selectedIds, colWidths, theme, isDark, platform, highlight, onRowClick, onRowContextMenu } = data;
+  const log = logs[index];
+  if (!log) return null;
+
+  const isSelected = selectedIds.has(log.id);
+
+  return (
+    <div
+      style={style}
+      className={clsx(
+        'flex items-start text-[11px] leading-[18px] group cursor-pointer border-b py-0.5',
+        isDark ? 'border-zinc-700/30' : 'border-slate-300/50',
+        getLevelColor(log.level, theme),
+        !isDark && 'font-medium',
+        isSelected
+          ? (isDark ? 'bg-blue-900/30 hover:bg-blue-900/40' : 'bg-blue-200/50 hover:bg-blue-200/70')
+          : (index % 2 === 0
+              ? (isDark ? 'bg-[#1F1F1F] hover:bg-zinc-700/30' : 'bg-[#ffffff] hover:bg-slate-200/50')
+              : (isDark ? 'bg-[#242424] hover:bg-zinc-700/30' : 'bg-[#f8f8f8] hover:bg-slate-200/50'))
+      )}
+      onClick={(e) => onRowClick(index, e)}
+      onContextMenu={(e) => onRowContextMenu(e, index)}
+    >
+      {platform === 'ios' ? (
+        <>
+          <div className="shrink-0 px-2 overflow-hidden whitespace-nowrap" style={{ width: colWidths.level }}>
+            <span className={`inline-flex items-center justify-center px-1.5 py-0.5 rounded-[3px] border text-[9px] font-medium min-w-[50px] ${getLevelBadgeClass(log.level, theme)}`}>
+              {getIosTypeLabel(log.level)}
+            </span>
+          </div>
+          <div className={clsx('shrink-0 px-3 overflow-hidden whitespace-nowrap font-mono', getTagColor(log.level, theme))} style={{ width: colWidths.time }}>
+            {formatTime(log.timestamp)}
+          </div>
+          <div className={clsx('shrink-0 truncate font-semibold px-3', getTagColor(log.level, theme))} title={log.tag} style={{ width: colWidths.tag }}>
+            {log.tag}
+          </div>
+          <div className={clsx('flex-1 whitespace-pre overflow-x-auto px-3 select-text custom-scrollbar', getMessageColor(log.level, theme))}>
+            {renderHighlighted(log.msg, highlight, isDark)}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className={clsx('shrink-0 px-3 overflow-hidden whitespace-nowrap font-mono', getTagColor(log.level, theme))} style={{ width: colWidths.time }}>
+            {formatTime(log.timestamp)}
+          </div>
+          <div className={clsx('shrink-0 px-3 overflow-hidden whitespace-nowrap', getTagColor(log.level, theme))} style={{ width: colWidths.pid }}>{log.pid}</div>
+          <div className={clsx('shrink-0 px-3 overflow-hidden whitespace-nowrap', getTagColor(log.level, theme))} style={{ width: colWidths.tid }}>{log.tid}</div>
+          <div className="shrink-0 font-bold px-3 overflow-hidden whitespace-nowrap" style={{ width: colWidths.level }}>
+            <span className={clsx('inline-block w-4 text-center', (log.level === 'E' || log.level === 'F') ? (isDark ? 'text-red-500' : 'text-red-600') : '')}>{log.level}</span>
+          </div>
+          <div className={clsx('shrink-0 truncate font-medium px-3', getTagColor(log.level, theme))} title={log.tag} style={{ width: colWidths.tag }}>{log.tag}</div>
+          <div className={clsx('flex-1 whitespace-pre overflow-x-auto px-3 select-text custom-scrollbar', getMessageColor(log.level, theme))}>
+            {renderHighlighted(log.msg, highlight, isDark)}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll, onToggleAutoScroll, platform = 'android', theme, onClearLogs, hasSelectedDevice = false, isLogging = false, highlight = '' }) => {
+  const listRef = useRef<List>(null);
+  const outerRef = useRef<HTMLDivElement>(null);
+  const userScrolledAway = useRef(false); // 追踪用户是否主动滚动离开底部
+  const frozenLogs = useRef<LogEntry[]>([]); // 暂停时冻结的日志快照
   const isDark = theme === 'dark';
-  const [selectedLogs, setSelectedLogs] = useState<Set<number>>(new Set());
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; logIndex: number | null } | null>(null);
   const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
 
   // 列宽状态管理 (单位: px)
-  const [colWidths, setColWidths] = useState({
+  const [colWidths, setColWidths] = useState<ColWidths>({
     time: 100,
     pid: 60,
     tid: 60,
@@ -101,23 +249,23 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
     return () => window.removeEventListener('click', handleClick);
   }, []);
 
-  // 当外部清空日志时，重置冻结状态
+  // 当外部清空日志时，重置冻结状态与选中
   useEffect(() => {
     if (logs.length === 0) {
       frozenLogs.current = [];
       userScrolledAway.current = false;
+      setSelectedIds(new Set());
+      setLastSelectedIndex(null);
     }
   }, [logs]);
 
   // 当用户暂停滚动时，冻结日志数组，避免页面不断更新
   useEffect(() => {
     if (!autoScroll && userScrolledAway.current) {
-      // 用户暂停了，冻结当前日志
       if (frozenLogs.current.length === 0 || frozenLogs.current !== logs) {
-        frozenLogs.current = logs.slice(); // 创建副本
+        frozenLogs.current = logs.slice();
       }
     } else if (autoScroll) {
-      // 恢复滚动，清空冻结
       frozenLogs.current = [];
     }
   }, [autoScroll]);
@@ -125,20 +273,17 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
   // 决定显示哪些日志：暂停时显示冻结的日志，否则显示实时日志
   const displayLogs = autoScroll || frozenLogs.current.length === 0 ? logs : frozenLogs.current;
 
-  // 处理键盘快捷键
+  // 处理键盘快捷键：Ctrl/Cmd + A 全选
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+A 或 Cmd+A 全选
       if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
         e.preventDefault();
-        const allIndices = new Set(displayLogs.map((_, index) => index));
-        setSelectedLogs(allIndices);
+        setSelectedIds(new Set(displayLogs.map(l => l.id)));
         if (displayLogs.length > 0) {
           setLastSelectedIndex(displayLogs.length - 1);
         }
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [displayLogs]);
@@ -146,39 +291,21 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
   // 当平台变化时，调整默认列宽
   useEffect(() => {
     if (platform === 'ios') {
-      setColWidths(prev => ({
-        ...prev,
-        time: 110,
-        pid: 0,
-        tid: 0,
-        level: 80,
-        tag: 240
-      }));
+      setColWidths(prev => ({ ...prev, time: 110, pid: 0, tid: 0, level: 80, tag: 240 }));
     } else {
-      setColWidths(prev => ({
-        ...prev,
-        time: 100,
-        tag: 160,
-        pid: 60,
-        tid: 60,
-        level: 50
-      }));
+      setColWidths(prev => ({ ...prev, time: 100, tag: 160, pid: 60, tid: 60, level: 50 }));
     }
   }, [platform]);
 
-
   // 处理列宽拖拽
-  const handleResizeStart = (e: React.MouseEvent, colKey: keyof typeof colWidths) => {
+  const handleResizeStart = (e: React.MouseEvent, colKey: keyof ColWidths) => {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = colWidths[colKey];
 
     const handleMouseMove = (moveEvent: MouseEvent) => {
       const deltaX = moveEvent.clientX - startX;
-      setColWidths(prev => ({
-        ...prev,
-        [colKey]: Math.max(30, startWidth + deltaX) // 最小宽度 30px
-      }));
+      setColWidths(prev => ({ ...prev, [colKey]: Math.max(30, startWidth + deltaX) }));
     };
 
     const handleMouseUp = () => {
@@ -192,82 +319,73 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
     document.body.style.cursor = 'col-resize';
   };
 
-  // 使用 useLayoutEffect 确保在浏览器绘制前调整滚动位置，防止闪烁
-  // 同时解决"明明有新日志却不滚动"的问题
-  useLayoutEffect(() => {
-    // 只有在自动滚动开启且用户没有主动滚动离开时才执行滚动
-    if (autoScroll && !userScrolledAway.current && containerRef.current) {
-      // 标记为正在自动滚动，防止 onScroll 事件误判为用户手动滚动
-      isAutoScrolling.current = true;
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-      
-      // 在下一帧重置标志位，确保 onScroll 事件处理完毕
-      requestAnimationFrame(() => {
-          isAutoScrolling.current = false;
-      });
+  // 数据变化时重置可变行高缓存（VariableSizeList 必需），并在需要时自动滚动到底部
+  useEffect(() => {
+    listRef.current?.resetAfterIndex(0);
+    if (autoScroll && !userScrolledAway.current && listRef.current && displayLogs.length > 0) {
+      listRef.current.scrollToItem(displayLogs.length - 1, 'end');
     }
   }, [displayLogs, autoScroll]);
 
-  const renderHeaderCell = (label: string, width: number, colKey: keyof typeof colWidths) => (
-    <div 
-        className={`relative shrink-0 flex items-center ${isDark ? 'bg-[#252529] text-zinc-400 border-zinc-700/50 hover:bg-zinc-700/50' : 'bg-[#e2e8f0] text-slate-700 border-slate-300 hover:bg-slate-200'} font-semibold border-r transition-colors group`}
-        style={{ width }}
-    >
-        <span className="px-2 truncate w-full text-[11px] uppercase tracking-wider">{label}</span>
-        <div 
-            className={`absolute right-0 top-1 bottom-1 w-[1px] ${isDark ? 'bg-zinc-700' : 'bg-slate-300'} group-hover:bg-blue-500/50 cursor-col-resize z-10`}
-            onMouseDown={(e) => handleResizeStart(e, colKey)}
-        />
-    </div>
-  );
-
-  // 格式化日志为文本
-  const formatLogAsText = (log: LogEntry): string => {
-    if (platform === 'ios') {
-      const time = log.timestamp && !isNaN(new Date(log.timestamp).getTime()) 
-        ? format(new Date(log.timestamp), 'HH:mm:ss.SSS') 
-        : log.timestamp;
-      return `[${getIosTypeLabel(log.level)}] ${time} ${log.tag}: ${log.msg}`;
+  // 虚拟列表滚动事件：判断用户是否离开底部
+  const handleListScroll = ({ scrollOffset, scrollUpdateWasRequested }: { scrollOffset: number; scrollUpdateWasRequested: boolean }) => {
+    // 程序触发的滚动（scrollToItem）直接忽略，避免误判为用户操作
+    if (scrollUpdateWasRequested) return;
+    const el = outerRef.current;
+    if (!el) return;
+    const isAtBottom = Math.abs(el.scrollHeight - scrollOffset - el.clientHeight) < 20;
+    if (!isAtBottom) {
+      userScrolledAway.current = true;
+      if (autoScroll) onScroll(false);
     } else {
-      const time = log.timestamp && !isNaN(new Date(log.timestamp).getTime()) 
-        ? format(new Date(log.timestamp), 'HH:mm:ss.SSS') 
-        : log.timestamp;
-      return `${time} ${log.pid} ${log.tid} ${log.level} ${log.tag}: ${log.msg}`;
+      userScrolledAway.current = false;
+      if (!autoScroll) onScroll(true);
     }
   };
 
-  // 处理日志点击选择
-  const handleLogClick = (index: number, e: React.MouseEvent) => {
-    // 阻止事件冒泡
+  const renderHeaderCell = (label: string, width: number, colKey: keyof ColWidths) => (
+    <div
+      className={`relative shrink-0 flex items-center ${isDark ? 'bg-[#181818] text-zinc-400 border-zinc-700/50 hover:bg-zinc-700/50' : 'bg-[#f8f8f8] text-slate-700 border-slate-300 hover:bg-slate-200'} font-semibold border-r transition-colors group`}
+      style={{ width }}
+    >
+      <span className="px-2 truncate w-full text-[11px] uppercase tracking-wider">{label}</span>
+      <div
+        className={`absolute right-0 top-1 bottom-1 w-[1px] ${isDark ? 'bg-zinc-700' : 'bg-slate-300'} group-hover:bg-blue-500/50 cursor-col-resize z-10`}
+        onMouseDown={(e) => handleResizeStart(e, colKey)}
+      />
+    </div>
+  );
+
+  // 处理日志点击选择（基于 log.id 记录，防止列表裁剪后错位）
+  const handleRowClick = (index: number, e: React.MouseEvent) => {
     e.stopPropagation();
-    
-    // 如果不是按住修饰键，清除文本选择
+    const log = displayLogs[index];
+    if (!log) return;
+
     if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
       window.getSelection()?.removeAllRanges();
     }
-    
+
     if (e.shiftKey && lastSelectedIndex !== null) {
-      // Shift + 点击：选择范围
       const start = Math.min(lastSelectedIndex, index);
       const end = Math.max(lastSelectedIndex, index);
-      const newSelected = new Set(selectedLogs);
+      const newSelected = new Set(selectedIds);
       for (let i = start; i <= end; i++) {
-        newSelected.add(i);
+        const l = displayLogs[i];
+        if (l) newSelected.add(l.id);
       }
-      setSelectedLogs(newSelected);
+      setSelectedIds(newSelected);
     } else if (e.ctrlKey || e.metaKey) {
-      // Ctrl/Cmd + 点击：切换单个选择
-      const newSelected = new Set(selectedLogs);
-      if (newSelected.has(index)) {
-        newSelected.delete(index);
+      const newSelected = new Set(selectedIds);
+      if (newSelected.has(log.id)) {
+        newSelected.delete(log.id);
       } else {
-        newSelected.add(index);
+        newSelected.add(log.id);
       }
-      setSelectedLogs(newSelected);
+      setSelectedIds(newSelected);
       setLastSelectedIndex(index);
     } else {
-      // 普通点击：单选
-      setSelectedLogs(new Set([index]));
+      setSelectedIds(new Set([log.id]));
       setLastSelectedIndex(index);
     }
   };
@@ -275,73 +393,99 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
   // 处理右键菜单
   const handleContextMenu = (e: React.MouseEvent, logIndex: number | null) => {
     e.preventDefault();
-    
-    // 如果右键的日志不在选中列表中，则只选中当前日志
-    if (logIndex !== null && !selectedLogs.has(logIndex)) {
-      setSelectedLogs(new Set([logIndex]));
-      setLastSelectedIndex(logIndex);
+
+    if (logIndex !== null) {
+      const log = displayLogs[logIndex];
+      if (log && !selectedIds.has(log.id)) {
+        setSelectedIds(new Set([log.id]));
+        setLastSelectedIndex(logIndex);
+      }
     }
-    
-    // 计算菜单位置，避免超出屏幕
-    const menuWidth = 180;
-    const menuHeight = 100;
-    
+
+    const menuWidth = 200;
+    const menuHeight = 140;
     let x = e.clientX;
     let y = e.clientY;
-    
-    if (x + menuWidth > window.innerWidth) {
-      x = window.innerWidth - menuWidth - 10;
-    }
-    
-    if (y + menuHeight > window.innerHeight) {
-      y = window.innerHeight - menuHeight - 10;
-    }
-    
+    if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth - 10;
+    if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight - 10;
     x = Math.max(10, x);
     y = Math.max(10, y);
-    
     setContextMenu({ x, y, logIndex });
+  };
+
+  // 收集要操作的日志（优先选中项，否则右键当前项）
+  const collectTargetLogs = (): LogEntry[] => {
+    if (selectedIds.size > 0) {
+      return displayLogs.filter(l => selectedIds.has(l.id));
+    }
+    if (contextMenu?.logIndex !== null && contextMenu?.logIndex !== undefined) {
+      const l = displayLogs[contextMenu.logIndex];
+      return l ? [l] : [];
+    }
+    return [];
   };
 
   // 复制日志
   const handleCopyLogs = async () => {
     try {
-      let textToCopy = '';
-      
-      if (selectedLogs.size > 0) {
-        // 复制选中的日志
-        const sortedIndices = Array.from(selectedLogs).sort((a, b) => a - b);
-        textToCopy = sortedIndices.map(index => formatLogAsText(displayLogs[index])).join('\n');
-      } else if (contextMenu?.logIndex !== null && contextMenu?.logIndex !== undefined) {
-        // 复制单行日志
-        textToCopy = formatLogAsText(displayLogs[contextMenu.logIndex]);
-      }
-      
+      const targets = collectTargetLogs();
+      const textToCopy = targets.map(l => formatLogAsText(l, platform)).join('\n');
       if (textToCopy) {
         await navigator.clipboard.writeText(textToCopy);
       }
-      
       setContextMenu(null);
     } catch (e) {
       console.error('复制失败:', e);
     }
   };
 
+  // 导出日志到文件（有选中则导出选中，否则导出全部当前日志）
+  const handleExportLogs = () => {
+    const targets = selectedIds.size > 0
+      ? displayLogs.filter(l => selectedIds.has(l.id))
+      : displayLogs;
+    if (targets.length === 0) {
+      setContextMenu(null);
+      return;
+    }
+    const text = targets.map(l => formatLogAsText(l, platform)).join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `logcat_${platform}_${format(new Date(), 'yyyyMMdd_HHmmss')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setContextMenu(null);
+  };
+
   // 清除日志
   const handleClearLogsClick = () => {
     frozenLogs.current = [];
     userScrolledAway.current = false;
-    if (onClearLogs) {
-      onClearLogs();
-    }
-    setSelectedLogs(new Set());
+    if (onClearLogs) onClearLogs();
+    setSelectedIds(new Set());
     setLastSelectedIndex(null);
     setContextMenu(null);
   };
 
+  const rowData: RowData = {
+    logs: displayLogs,
+    selectedIds,
+    colWidths,
+    theme,
+    isDark,
+    platform,
+    highlight,
+    onRowClick: handleRowClick,
+    onRowContextMenu: handleContextMenu,
+  };
+
   return (
-    <div className={`absolute inset-0 ${isDark ? 'bg-[#1e1e20] text-zinc-300' : 'bg-[#f1f5f9] text-slate-800'} flex flex-col font-mono`}>
-       <div className={`flex border-b ${isDark ? 'border-zinc-700/50 bg-[#252529]' : 'border-slate-300 bg-[#e2e8f0]'} shrink-0 select-none h-8 shadow-sm z-10`}>
+    <div className={`absolute inset-0 ${isDark ? 'bg-[#1F1F1F] text-zinc-300' : 'bg-[#ffffff] text-slate-800'} flex flex-col font-mono`}>
+       <div className={`flex border-b ${isDark ? 'border-zinc-700/50 bg-[#181818]' : 'border-slate-300 bg-[#f8f8f8]'} shrink-0 select-none h-8 shadow-sm z-10`}>
         {platform === 'ios' ? (
             <>
               {renderHeaderCell("Type", colWidths.level, "level")}
@@ -360,110 +504,47 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
             </>
         )}
       </div>
-      
-      <div 
-        ref={containerRef}
-        className="flex-1 overflow-auto custom-scrollbar"
-        onContextMenu={(e) => handleContextMenu(e, null)}
-        onScroll={(e) => {
-            // 如果是程序自动滚动触发的事件，直接忽略，不改变 autoScroll 状态
-            if (isAutoScrolling.current) return;
 
-            const target = e.currentTarget;
-            // 增加 10px 的容差，处理不同缩放比例下的精度问题，让吸附更稳定
-            const isAtBottom = Math.abs(target.scrollHeight - target.scrollTop - target.clientHeight) < 10;
-            
-            // 只有当用户确实向上滚动离开了底部，才取消自动滚动
-            if (!isAtBottom) {
-                userScrolledAway.current = true; // 标记用户已滚动离开
-                if (autoScroll) {
-                    onScroll(false);
-                }
-            } else {
-                userScrolledAway.current = false; // 用户回到底部，清除标记
-                // 如果用户手动滚回到底部，恢复自动滚动
-                if (!autoScroll) {
-                    onScroll(true);
-                }
-            }
-        }}
-      >
-        {displayLogs.length === 0 && (
-            <div className={`flex flex-col items-center justify-center h-full gap-4`}>
-              {isLogging ? (
-                <div className="flex flex-col items-center gap-3 opacity-40">
-                  <div className="w-12 h-12 rounded-full border-4 border-zinc-500/20 border-t-zinc-500 animate-spin" />
-                  <div className="text-zinc-500 text-xs font-medium uppercase tracking-widest">Waiting for stream...</div>
-                </div>
-              ) : (
-                <div className={`flex flex-col items-center gap-4 opacity-50 ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>
-                  <Terminal size={48} strokeWidth={1} />
-                  <div className="text-sm font-medium">Waiting for logs...</div>
-                </div>
-              )}
-            </div>
+      <div className="flex-1 relative" onContextMenu={(e) => handleContextMenu(e, null)}>
+        {displayLogs.length === 0 ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
+            {isLogging ? (
+              <div className="flex flex-col items-center gap-3 opacity-40">
+                <div className="w-12 h-12 rounded-full border-4 border-zinc-500/20 border-t-zinc-500 animate-spin" />
+                <div className="text-zinc-500 text-xs font-medium uppercase tracking-widest">Waiting for stream...</div>
+              </div>
+            ) : (
+              <div className={`flex flex-col items-center gap-4 opacity-50 ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>
+                <Terminal size={48} strokeWidth={1} />
+                <div className="text-sm font-medium">Waiting for logs...</div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <AutoSizer>
+            {({ height, width }: { height: number; width: number }) => (
+              <List
+                ref={listRef}
+                outerRef={outerRef}
+                height={height}
+                width={width}
+                itemCount={displayLogs.length}
+                itemSize={(index: number) => getItemSize(displayLogs[index]?.msg || '')}
+                estimatedItemSize={22}
+                itemData={rowData}
+                overscanCount={20}
+                onScroll={handleListScroll}
+                className="custom-scrollbar"
+              >
+                {LogRow}
+              </List>
+            )}
+          </AutoSizer>
         )}
-        
-        {displayLogs.map((log, index) => {
-             const isSelected = selectedLogs.has(index);
-             return (
-             <div 
-                key={`${log.id}-${index}`}
-                className={clsx(
-                    `flex border-b py-1 items-start text-[11px] leading-relaxed group transition-colors cursor-pointer`,
-                    isDark ? 'border-zinc-700/30' : 'border-slate-300/50',
-                    getLevelColor(log.level, theme),
-                    // 亮色模式下整体字体稍微加粗
-                    !isDark && "font-medium",
-                    // 选中状态（优先级最高）
-                    isSelected ? (
-                      isDark ? "bg-blue-900/30 hover:bg-blue-900/40" : "bg-blue-200/50 hover:bg-blue-200/70"
-                    ) : (
-                      // 未选中状态：斑马纹 + hover
-                      index % 2 === 0 
-                        ? (isDark ? "bg-[#1e1e20] hover:bg-zinc-700/30" : "bg-[#f1f5f9] hover:bg-slate-200/50")
-                        : (isDark ? "bg-[#232326] hover:bg-zinc-700/30" : "bg-[#e6ecf0] hover:bg-slate-200/50")
-                    )
-                )}
-                onClick={(e) => handleLogClick(index, e)}
-                onContextMenu={(e) => handleContextMenu(e, index)}
-            >
-                {platform === 'ios' ? (
-                    <>
-                        <div className="shrink-0 px-2 overflow-hidden whitespace-nowrap pt-0.5" style={{ width: colWidths.level }}>
-                          <span className={`inline-flex items-center justify-center px-1.5 py-0.5 rounded-[3px] border text-[9px] font-medium min-w-[50px] ${getLevelBadgeClass(log.level, theme)}`}>
-                            {getIosTypeLabel(log.level)}
-                          </span>
-                        </div>
-                        <div className={clsx("shrink-0 px-3 overflow-hidden whitespace-nowrap select-all pt-0.5 font-mono transition-colors", getTagColor(log.level, theme))} style={{ width: colWidths.time }}>
-                            {log.timestamp && !isNaN(new Date(log.timestamp).getTime()) ? format(new Date(log.timestamp), 'HH:mm:ss.SSS') : log.timestamp}
-                        </div>
-                        <div className={clsx("shrink-0 truncate font-semibold px-3 select-all pt-0.5 transition-colors", getTagColor(log.level, theme))} title={log.tag} style={{ width: colWidths.tag }}>
-                            {log.tag}
-                        </div>
-                        <div className={clsx("flex-1 whitespace-pre-wrap break-all px-3 select-text transition-colors", getMessageColor(log.level, theme))}>{log.msg}</div>
-                    </>
-                ) : (
-                    <>
-                        <div className={clsx("shrink-0 px-3 overflow-hidden whitespace-nowrap select-all pt-0.5 font-mono transition-colors", getTagColor(log.level, theme))} style={{ width: colWidths.time }}>
-                            {log.timestamp && !isNaN(new Date(log.timestamp).getTime()) ? format(new Date(log.timestamp), 'HH:mm:ss.SSS') : log.timestamp}
-                        </div>
-                        <div className={clsx("shrink-0 px-3 overflow-hidden whitespace-nowrap select-all pt-0.5 transition-colors", getTagColor(log.level, theme))} style={{ width: colWidths.pid }}>{log.pid}</div>
-                        <div className={clsx("shrink-0 px-3 overflow-hidden whitespace-nowrap select-all pt-0.5 transition-colors", getTagColor(log.level, theme))} style={{ width: colWidths.tid }}>{log.tid}</div>
-                        <div className="shrink-0 font-bold px-3 overflow-hidden whitespace-nowrap pt-0.5" style={{ width: colWidths.level }}>
-                            <span className={clsx("inline-block w-4 text-center", (log.level === 'E' || log.level === 'F') ? (isDark ? "text-red-500" : "text-red-600") : "")}>{log.level}</span>
-                        </div>
-                        <div className={clsx("shrink-0 truncate font-medium px-3 select-all pt-0.5 transition-colors", getTagColor(log.level, theme))} title={log.tag} style={{ width: colWidths.tag }}>{log.tag}</div>
-                        <div className={clsx("flex-1 whitespace-pre-wrap break-all px-3 select-text transition-colors", getMessageColor(log.level, theme))}>{log.msg}</div>
-                    </>
-                )}
-            </div>
-             );
-        })}
       </div>
 
       {/* 底部快捷键工具栏 */}
-      <div className={`shrink-0 border-t ${isDark ? 'border-zinc-800 bg-[#1a1a1d]' : 'border-slate-300 bg-white'} px-3 py-1.5 flex items-center gap-4 text-[10px] ${isDark ? 'text-zinc-400' : 'text-slate-600'} h-9`}>
+      <div className={`shrink-0 border-t ${isDark ? 'border-zinc-800 bg-[#181818]' : 'border-slate-300 bg-white'} px-3 py-1.5 flex items-center gap-4 text-[10px] ${isDark ? 'text-zinc-400' : 'text-slate-600'} h-9`}>
         <div className="flex items-center gap-1.5">
           <kbd className={`px-1.5 py-0.5 rounded ${isDark ? 'bg-zinc-700 border border-zinc-600' : 'bg-slate-100 border border-slate-300'} font-mono`}>Click</kbd>
           <span>单选</span>
@@ -488,16 +569,19 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
         </div>
         <div className="flex items-center gap-1.5">
           <kbd className={`px-1.5 py-0.5 rounded ${isDark ? 'bg-zinc-700 border border-zinc-600' : 'bg-slate-100 border border-slate-300'} font-mono`}>右键</kbd>
-          <span>复制/清除</span>
+          <span>复制/导出/清除</span>
         </div>
-        {selectedLogs.size > 0 && (
-          <div className={`ml-auto flex items-center gap-2 ${isDark ? 'text-blue-400' : 'text-blue-600'} font-medium`}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-            <span>已选中 {selectedLogs.size} 行</span>
-          </div>
-        )}
+        <div className={`ml-auto flex items-center gap-4 ${isDark ? 'text-zinc-500' : 'text-slate-500'}`}>
+          {selectedIds.size > 0 && (
+            <div className={`flex items-center gap-2 ${isDark ? 'text-blue-400' : 'text-blue-600'} font-medium`}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+              <span>已选中 {selectedIds.size} 行</span>
+            </div>
+          )}
+          <span className="font-medium tabular-nums">共 {displayLogs.length.toLocaleString()} 条</span>
+        </div>
       </div>
 
       {/* 悬浮自动滚动按钮 */}
@@ -505,13 +589,12 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
       <button
         onClick={() => {
           onToggleAutoScroll();
-          // 如果是从暂停切换到自动滚动，立即滚动到底部
-          if (!autoScroll && containerRef.current) {
+          if (!autoScroll) {
             userScrolledAway.current = false;
             frozenLogs.current = [];
             setTimeout(() => {
-              if (containerRef.current) {
-                containerRef.current.scrollTop = containerRef.current.scrollHeight;
+              if (listRef.current && displayLogs.length > 0) {
+                listRef.current.scrollToItem(displayLogs.length - 1, 'end');
               }
             }, 50);
           }
@@ -519,20 +602,20 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
         className={`fixed bottom-16 right-6 z-20 flex items-center gap-1.5 px-3 py-1.5 rounded-full shadow-xl font-medium text-xs transition-all duration-200 active:scale-95 ${
           autoScroll
             ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-blue-500/30'
-            : (isDark 
-                ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 border border-zinc-700' 
+            : (isDark
+                ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 border border-zinc-700'
                 : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-300')
         }`}
         title={autoScroll ? '点击关闭自动滚动' : '点击开启自动滚动'}
       >
-        <svg 
-          width="14" 
-          height="14" 
-          viewBox="0 0 24 24" 
-          fill="none" 
-          stroke="currentColor" 
-          strokeWidth="2" 
-          strokeLinecap="round" 
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
           strokeLinejoin="round"
           className={autoScroll ? 'animate-bounce' : ''}
         >
@@ -546,7 +629,7 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
       {/* 右键菜单 */}
       {contextMenu && (
         <div
-          className={`fixed z-50 ${isDark ? 'bg-zinc-800 border-zinc-700' : 'bg-white border-slate-300'} border rounded-lg shadow-xl py-1 min-w-[180px]`}
+          className={`fixed z-50 ${isDark ? 'bg-zinc-800 border-zinc-700' : 'bg-white border-slate-300'} border rounded-lg shadow-xl py-1 min-w-[190px]`}
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -558,7 +641,18 @@ export const LogViewer: React.FC<LogViewerProps> = ({ logs, autoScroll, onScroll
               <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
             </svg>
-            {selectedLogs.size > 1 ? `复制选中的日志 (${selectedLogs.size})` : '复制日志'}
+            {selectedIds.size > 1 ? `复制选中的日志 (${selectedIds.size})` : '复制日志'}
+          </button>
+          <button
+            className={`w-full px-4 py-2 text-left text-xs ${isDark ? 'hover:bg-zinc-700 text-zinc-200' : 'hover:bg-slate-100 text-slate-900'} flex items-center gap-2`}
+            onClick={handleExportLogs}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            {selectedIds.size > 0 ? `导出选中的日志 (${selectedIds.size})` : '导出全部日志'}
           </button>
           <div className={`h-px ${isDark ? 'bg-zinc-700' : 'bg-slate-200'} my-1`} />
           <button

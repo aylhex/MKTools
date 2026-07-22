@@ -44,14 +44,14 @@ body {
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: #cbd5e1; /* slate-300 */
+  background: #c1c1c1; /* VS Code Light Modern scrollbar */
   border-radius: 5px;
   border: 2px solid transparent; /* Simplify border */
   background-clip: content-box;
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8; /* slate-400 */
+  background: #a6a6a6; /* VS Code Light Modern scrollbar hover */
   border: 2px solid transparent;
   background-clip: content-box;
 }
@@ -60,16 +60,16 @@ body {
   background: transparent;
 }
 
-/* Modern Scrollbar - Dark Mode */
+/* Modern Scrollbar - Dark Mode (VS Code Dark Modern) */
 .dark .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: #3f3f46; /* zinc-700 */
-  border: 2px solid #1e1e20; /* Match dark bg */
+  background: #424242; /* VS Code Dark Modern scrollbar slider */
+  border: 2px solid #1F1F1F; /* Match editor bg */
   background-clip: padding-box;
 }
 
 .dark .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: #52525b; /* zinc-600 */
-  border: 2px solid #1e1e20;
+  background: #4F4F4F; /* VS Code Dark Modern scrollbar hover */
+  border: 2px solid #1F1F1F;
 }
 
 /* Animation delay utilities */

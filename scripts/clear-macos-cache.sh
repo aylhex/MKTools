@@ -1,6 +1,10 @@
 #!/bin/bash
 
+# 项目根目录（脚本自身所在目录的上一级）
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 echo "🧹 清除 macOS 应用缓存..."
+echo "   项目路径: $PROJECT_ROOT"
 echo ""
 
 # 1. 完全退出所有 Electron 进程
@@ -9,6 +13,15 @@ pkill -9 -f "Electron" 2>/dev/null
 pkill -9 -f "electron" 2>/dev/null
 sleep 1
 echo "   ✅ 已停止"
+
+# 1.5 阻止 Spotlight 索引项目目录（否则 node_modules 里的 Electron.app 改名副本、
+#    以及 dist_build 里的中间产物都会被启动器/Spotlight 搜索到，出现重复应用）
+echo "1️⃣.5 阻止 Spotlight 索引项目目录..."
+# .metadata_never_index：macOS 官方约定，放此空文件会跳过整个目录的 Spotlight 索引
+touch "$PROJECT_ROOT/.metadata_never_index"
+# 已被索引的立即清除（部分 macOS 版本 mdutil 需要 sudo）
+mdutil -Eai "$PROJECT_ROOT" 2>/dev/null || sudo mdutil -Eai "$PROJECT_ROOT" 2>/dev/null
+echo "   ✅ Spotlight 已排除项目目录（node_modules / dist_build 里的 .app 不会再被搜到）"
 
 # 2. 清除 Launch Services 数据库
 echo "2️⃣ 清除 Launch Services 数据库..."

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Theme, FileEntry } from '../types';
-import { RefreshCw, FolderPlus, Upload, Download, Trash2, HardDrive, ChevronRight, ChevronDown, Folder, File, FolderOpen, CornerLeftUp } from 'lucide-react';
+import { RefreshCw, FolderPlus, Upload, Download, Trash2, HardDrive, ChevronRight, ChevronDown, Folder, File, FolderOpen, CornerLeftUp, Lock } from 'lucide-react';
 import { Tooltip } from './Tooltip';
 
 interface FileManagerProps {
@@ -44,6 +44,14 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
   const [installProgress, setInstallProgress] = useState<{ fileName: string } | null>(null);
   const [isJailbroken, setIsJailbroken] = useState<boolean>(false);
   const [initializing, setInitializing] = useState<boolean>(false);
+  // 权限受限提示（仅当前目录），非空时右侧显示"需要 root 权限"占位符，不弹全局错误 toast
+  const [permissionError, setPermissionError] = useState<string | null>(null);
+
+  // 判断错误是否为「权限受限」类，用于避免弹全局错误 toast，改为在列表区域显示友好占位符
+  const isPermissionError = (msg: string | undefined): boolean => {
+    if (!msg) return false;
+    return msg.includes('Permission denied') || msg.includes('无权限');
+  };
 
   // 检查选中的文件是否是可安装的应用包
   const isInstallableFile = useMemo(() => {
@@ -181,22 +189,31 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
     if (!deviceId) return;
     // 对于 iOS，如果没有 bundleId（系统根目录模式），也允许加载
     // if (platform === 'ios' && !bundleId) return;  // 移除这个检查
-    
+
     setSelectedPath(path);
+    setPermissionError(null); // 切换目录时先清除上一次的权限提示
     setLoading(true);
     try {
-      const list = await window.ipcRenderer.invoke('fs-list', { 
-        deviceId, 
-        platform, 
-        path, 
+      const list = await window.ipcRenderer.invoke('fs-list', {
+        deviceId,
+        platform,
+        path,
         bundleId: bundleId || undefined,  // 如果是空字符串，传 undefined
         skipSymlinkResolution: false  // 右侧文件列表需要解析符号链接，显示最终地址
       });
       setEntries(list || []);
       setSelected(null);
     } catch (e: any) {
-      onError(e?.message || '加载目录内容失败');
-      setEntries([]);
+      const msg = e?.message || '加载目录内容失败';
+      // 权限受限时：在文件列表区域显示友好占位符，不弹全局错误 toast，避免每次点击都被打断
+      if (isPermissionError(msg)) {
+        setPermissionError('该目录被系统保护，普通 ADB Shell 无法读取。');
+        setEntries([]);
+        setSelected(null);
+      } else {
+        onError(msg);
+        setEntries([]);
+      }
     } finally {
       setLoading(false);
     }
@@ -248,7 +265,10 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
       
       return children;
     } catch (e: any) {
-      onError(e?.message || '加载子目录失败');
+      const msg = e?.message || '';
+      // 权限受限的子目录静默返回空，避免展开左侧目录树时弹全局错误
+      if (isPermissionError(msg)) return [];
+      onError(msg || '加载子目录失败');
       return [];
     }
   };
@@ -940,7 +960,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
         </div>
 
         {/* 底部状态栏 */}
-        <div className={`px-4 py-1.5 border-t ${isDark ? 'border-zinc-800 bg-[#1a1a1d] text-zinc-400' : 'border-slate-300 bg-white text-slate-600'} text-[10px] flex items-center justify-between shrink-0 h-9`}>
+        <div className={`px-4 py-1.5 border-t ${isDark ? 'border-zinc-800 bg-[#181818] text-zinc-400' : 'border-slate-300 bg-white text-slate-600'} text-[10px] flex items-center justify-between shrink-0 h-9`}>
           <div className="flex items-center gap-1.5">
             <div className={`w-1.5 h-1.5 rounded-full ${deviceId ? 'bg-green-500 animate-pulse' : (isDark ? 'bg-zinc-700' : 'bg-slate-200')}`}></div>
             <span className="font-bold tracking-tight uppercase">{treeData.length} 个目录</span>
@@ -949,8 +969,8 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
       </div>
 
       {/* 右侧目录详情模块 */}
-      <div className={`flex-1 flex flex-col overflow-hidden ${isDark ? 'bg-[#1e1e20]' : 'bg-[#f1f5f9]'}`}>
-        <div className={`flex items-center justify-between px-6 py-3 border-b shrink-0 ${isDark ? 'bg-[#252529] border-zinc-700/50' : 'bg-[#e2e8f0] border-slate-300'}`}>
+      <div className={`flex-1 flex flex-col overflow-hidden ${isDark ? 'bg-[#1F1F1F]' : 'bg-[#ffffff]'}`}>
+        <div className={`flex items-center justify-between px-6 py-3 border-b shrink-0 ${isDark ? 'bg-[#181818] border-zinc-700/50' : 'bg-[#f8f8f8] border-slate-300'}`}>
           <div className="flex items-center gap-3 flex-1 min-w-0">
             <div className="flex items-center gap-1">
               <Tooltip content="刷新">
@@ -962,7 +982,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
                 </button>
               </Tooltip>
             </div>
-            <div className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-xl border text-[11px] font-mono truncate ${isDark ? 'bg-[#1e1e20] border-zinc-700/50 text-zinc-400' : 'bg-[#f1f5f9] border-slate-300 text-slate-600'}`}>
+            <div className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-xl border text-[11px] font-mono truncate ${isDark ? 'bg-[#1F1F1F] border-zinc-700/50 text-zinc-400' : 'bg-[#ffffff] border-slate-300 text-slate-600'}`}>
               <Folder size={14} className="shrink-0 opacity-50" />
               <span className="truncate">{selectedPath || '未选择目录'}</span>
             </div>
@@ -1033,7 +1053,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
         >
           {entries.length > 0 || loading ? (
             <table className="w-full border-collapse">
-              <thead className={`sticky top-0 z-10 ${isDark ? 'bg-[#252529]' : 'bg-[#e2e8f0]'} backdrop-blur-md border-b ${isDark ? 'border-zinc-700/50' : 'border-slate-300'}`}>
+              <thead className={`sticky top-0 z-10 ${isDark ? 'bg-[#181818]' : 'bg-[#f8f8f8]'} backdrop-blur-md border-b ${isDark ? 'border-zinc-700/50' : 'border-slate-300'}`}>
                 <tr className={`text-[10px] font-bold uppercase tracking-[0.2em] ${isDark ? 'text-zinc-500' : 'text-slate-400'}`}>
                   <th className="px-6 py-4 text-left w-12">#</th>
                   <th className="px-4 py-4 text-left">名称</th>
@@ -1145,9 +1165,29 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
                 ))}
               </tbody>
             </table>
+          ) : !loading && permissionError ? (
+            <div className="flex flex-col items-center justify-center gap-5 px-8 animate-in fade-in zoom-in-95 duration-500">
+              <div className={`p-8 rounded-3xl ${isDark ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-amber-50 border border-amber-200 shadow-sm'}`}>
+                <Lock size={48} strokeWidth={1.2} className={isDark ? 'text-amber-400' : 'text-amber-600'} />
+              </div>
+              <div className="space-y-2 text-center max-w-md">
+                <p className={`text-sm font-bold ${isDark ? 'text-amber-300' : 'text-amber-700'}`}>
+                  无权限访问该目录
+                </p>
+                <p className={`text-xs font-medium leading-relaxed ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
+                  {permissionError}
+                </p>
+                <p className={`text-[10px] font-mono mt-3 ${isDark ? 'text-zinc-600' : 'text-slate-400'}`}>
+                  {selectedPath}
+                </p>
+                <p className={`text-[10px] mt-4 ${isDark ? 'text-zinc-500' : 'text-slate-500'}`}>
+                  提示：此目录受 Android 系统保护，需 root 或 debug 版系统才能访问
+                </p>
+              </div>
+            </div>
           ) : !loading && (
             <div className="flex flex-col items-center justify-center gap-5 opacity-30 animate-in fade-in zoom-in-95 duration-500">
-              <div className={`p-8 rounded-3xl ${isDark ? 'bg-[#252529]' : 'bg-white border border-slate-300 shadow-sm'}`}>
+              <div className={`p-8 rounded-3xl ${isDark ? 'bg-[#181818]' : 'bg-white border border-slate-300 shadow-sm'}`}>
                 <Folder size={48} strokeWidth={1} />
               </div>
               <div className="space-y-1 text-center">
@@ -1172,7 +1212,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
         </div>
 
         {/* 底部状态栏 */}
-        <div className={`h-9 px-6 flex items-center justify-between border-t text-[10px] font-bold shrink-0 ${isDark ? 'bg-[#1a1a1d] border-zinc-800 text-zinc-400' : 'bg-white border-slate-300 text-slate-600'}`}>
+        <div className={`h-9 px-6 flex items-center justify-between border-t text-[10px] font-bold shrink-0 ${isDark ? 'bg-[#181818] border-zinc-800 text-zinc-400' : 'bg-white border-slate-300 text-slate-600'}`}>
           <div className="flex items-center gap-6">
              <div className="flex items-center gap-2">
                 <span className={`w-1.5 h-1.5 rounded-full ${selectedPath ? 'bg-green-500' : 'bg-zinc-700'}`} />

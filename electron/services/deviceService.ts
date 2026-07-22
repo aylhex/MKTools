@@ -127,6 +127,82 @@ export async function getAndroidApps(deviceId: string): Promise<{ bundleId: stri
   }
 }
 
+/**
+ * 获取某个 Android 应用当前运行的所有进程 PID（含 :xxx 子进程）。
+ * 用于日志按包名过滤——由于进程可能重启导致 PID 变化，调用方需定期刷新。
+ */
+export async function getAndroidPackagePids(deviceId: string, packageName: string): Promise<number[]> {
+  const pkg = (packageName || '').trim();
+  if (!pkg) return [];
+
+  const adbPath = getAdbPath();
+  const pids = new Set<number>();
+
+  try {
+    const { stdout } = await execPromise(`"${adbPath}" -s "${deviceId}" shell pidof ${pkg}`);
+    stdout.trim().split(/\s+/).forEach(p => {
+      const n = parseInt(p, 10);
+      if (!isNaN(n)) pids.add(n);
+    });
+  } catch (e) {
+    // pidof 不存在或该应用未运行，交由 ps 兜底
+  }
+
+  try {
+    const { stdout } = await execPromise(`"${adbPath}" -s "${deviceId}" shell ps -A`);
+    const lines = stdout.split('\n');
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      const parts = t.split(/\s+/);
+      if (parts.length < 2) continue;
+      const name = parts[parts.length - 1];
+      if (name === pkg || name.startsWith(`${pkg}:`)) {
+        const pid = parseInt(parts[1], 10);
+        const pidFallback = parseInt(parts[0], 10);
+        if (!isNaN(pid)) pids.add(pid);
+        else if (!isNaN(pidFallback)) pids.add(pidFallback);
+      }
+    }
+  } catch (e) {
+    // ps 语法不兼容时忽略
+  }
+
+  return Array.from(pids);
+}
+
+/**
+ * 检测 Android 设备是否已 root（能获得 uid=0 的 shell）。
+ * 依次尝试 3 种常见方式：`su 0 id -u` / `su -c "id -u"` / `adb root` 后普通 `id -u`。
+ * 只要有一种返回 `0`，即视为已 root。
+ */
+export async function checkAndroidRoot(deviceId: string): Promise<boolean> {
+  const adb = getAdbPath();
+  const TIMEOUT = { timeout: 5000 };
+
+  // 方式 1：su 0 id -u（Magisk / SuperSU 常见）
+  try {
+    const { stdout } = await execPromise(`"${adb}" -s "${deviceId}" shell su 0 id -u`, TIMEOUT);
+    if (stdout.trim() === '0') return true;
+  } catch { /* try next */ }
+
+  // 方式 2：su -c "id -u"（老式 su）
+  try {
+    const { stdout } = await execPromise(`"${adb}" -s "${deviceId}" shell 'su -c "id -u"'`, TIMEOUT);
+    if (stdout.trim() === '0') return true;
+  } catch { /* try next */ }
+
+  // 方式 3：adb root 后 id -u（debug/userdebug 系统）
+  try {
+    await execPromise(`"${adb}" -s "${deviceId}" root`, TIMEOUT);
+    await new Promise(r => setTimeout(r, 1200));
+    const { stdout } = await execPromise(`"${adb}" -s "${deviceId}" shell id -u`, TIMEOUT);
+    if (stdout.trim() === '0') return true;
+  } catch { /* not rooted */ }
+
+  return false;
+}
+
 export async function getAndroidAppIcon(deviceId: string, packageName: string): Promise<string | null> {
   try {
     const adbPath = getAdbPath();

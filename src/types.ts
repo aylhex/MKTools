@@ -20,6 +20,7 @@ export interface FilterState {
   tag: string;
   pid: string;
   search: string;
+  package?: string; // Android 按应用包名过滤
 }
 
 export type Theme = 'light' | 'dark';
