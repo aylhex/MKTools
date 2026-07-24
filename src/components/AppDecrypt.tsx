@@ -40,6 +40,9 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
   useEffect(() => {
     // 切换设备时重置手动 override，防止把 A 设备的确认套用到 B 设备
     setManualOverride(false);
+    if (deviceId && initialPlatform === 'ios') {
+      window.ipcRenderer.invoke('unset-forced-jailbreak', { deviceId }).catch(() => {});
+    }
     if (!deviceId) { setDeviceStatus('unknown'); return; }
     let active = true;
     setDeviceStatus('checking');
@@ -55,6 +58,22 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
     })();
     return () => { active = false; };
   }, [deviceId, initialPlatform]);
+
+  // 手动强制越狱模式：登记到后端 + 立即刷新一次应用列表（省得用户还要手动点刷新）
+  const handleManualOverride = async () => {
+    if (!deviceId) return;
+    try {
+      if (initialPlatform === 'ios') {
+        // 后端登记：清缓存 → 强制标记为越狱（默认 SSH 22 / alpine，供 iosSshService 后续使用）
+        await window.ipcRenderer.invoke('clear-jailbreak-cache', { deviceId });
+        await window.ipcRenderer.invoke('set-forced-jailbreak', { deviceId, password: 'alpine', remotePort: 22 });
+      }
+      setManualOverride(true);
+      setDeviceStatus('privileged');
+    } catch (e: any) {
+      onError(`切换到强制越狱模式失败: ${e?.message || e}`);
+    }
+  };
 
   // Fetch apps
   useEffect(() => {
@@ -560,7 +579,7 @@ export const AppDecrypt: React.FC<AppDecryptProps> = ({ theme, platform: initial
               {/* 手动 override：若用户确认设备已越狱/Root 但自动检测不通过（如未装 frida-tools），允许强制继续 */}
               <div className="flex flex-col items-center gap-2 mt-2 max-w-md">
                 <button
-                  onClick={() => setManualOverride(true)}
+                  onClick={handleManualOverride}
                   className={`px-4 py-2 text-xs font-medium rounded-lg border transition-all ${
                     isDark
                       ? 'border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 hover:bg-zinc-800'

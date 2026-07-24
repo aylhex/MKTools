@@ -6,9 +6,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { getAdbPath, getIosToolPath } from '../utils/paths';
 import { execSshCommand, uploadSshFile, checkJailbreak } from './iosSshService';
+import { resolveExecutable } from '../utils/env';
 import { saveIconsBatch, getIconsBatch } from './iconCacheService';
+import * as fridaClient from './fridaClient';
 
 const execPromise = util.promisify(exec);
+
+// 仅供 Android 相关 fallback（frida-dexdump / spawn frida）使用。
+// iOS 场景已全面切换到 fridaClient（Node bindings），不再需要外部 CLI。
+function fridaCmd(name: 'frida' | 'frida-ps' | 'frida-dexdump'): string {
+  const abs = resolveExecutable(name);
+  return abs || name;
+}
 
 export interface DecryptOptions {
   deviceId: string;
@@ -35,7 +44,7 @@ function getFridaResourcePath(): string {
 
 export async function checkFridaInstalled(): Promise<boolean> {
   try {
-    await execPromise('frida --version');
+    await execPromise(`"${fridaCmd('frida')}" --version`);
     return true;
   } catch (e) {
     return false;
@@ -71,26 +80,30 @@ async function runAsRoot(adb: string, deviceId: string, cmd: string): Promise<st
 
 // 检查并部署 Frida Server (Android)
 export async function checkAndDeployFridaServer(deviceId: string, platform: 'android' | 'ios', onLog: (msg: string) => void): Promise<boolean> {
+  const fpsBin = fridaCmd('frida-ps');
   const fridaArgs = `-D "${deviceId}"`; // Use specific device ID
 
   if (platform === 'ios') {
-    // iOS: Check connection via frida-ps
-    onLog(`[Frida] Checking iOS Frida connection (Device: ${deviceId})...`);
+    // iOS: Check connection via frida-ps —— 用绝对路径，避免 PATH 找不到
+    onLog(`[Frida] Checking iOS Frida connection (Device: ${deviceId}, bin: ${fpsBin})...`);
     try {
-      const { stdout } = await execPromise(`frida-ps ${fridaArgs}`);
-      if (stdout.includes('PID')) {
+      const { stdout } = await execPromise(`"${fpsBin}" ${fridaArgs}`, { timeout: 10000 });
+      // frida-ps 输出至少有一行 "PID  Name"；不同版本表头略有差异，只要非空就认为通
+      if (stdout && stdout.trim().length > 0) {
         onLog('[Frida] Frida Server is running on iOS.');
         return true;
       }
-    } catch (e) {
-      onLog('[Frida] Connection failed. Checking if device is jailbroken and SSH is available...');
+    } catch (e: any) {
+      onLog(`[Frida] frida-ps connection failed: ${(e?.message || '').slice(0, 200)}`);
+      onLog('[Frida] Falling back to SSH-based deployment...');
     }
 
     // Try to deploy if SSH is available
     try {
       const isJailbroken = await checkJailbreak(deviceId);
       if (!isJailbroken) {
-        onLog('[Frida Error] Device is not accessible via SSH (not jailbroken or iproxy failed). Cannot deploy Frida.');
+        onLog('[Frida Error] 设备既没有可用的 frida-server，也无法通过 SSH/installation_proxy 判定为越狱设备。');
+        onLog('[Frida Error] 请确认：1) 设备已越狱；2) 已在 Sileo/Cydia 中安装 Frida（源: https://build.frida.re）；3) 或本机已通过 pip 安装 frida-tools 且 frida-ps 命令可用。');
         return false;
       }
 
@@ -136,8 +149,8 @@ export async function checkAndDeployFridaServer(deviceId: string, platform: 'and
       await new Promise(r => setTimeout(r, 5000));
       
       try {
-        const { stdout } = await execPromise(`frida-ps ${fridaArgs}`);
-        if (stdout.includes('PID')) {
+        const { stdout } = await execPromise(`"${fpsBin}" ${fridaArgs}`, { timeout: 10000 });
+        if (stdout && stdout.trim().length > 0) {
           onLog('[Frida] Frida Server started successfully.');
           return true;
         }
@@ -174,7 +187,7 @@ export async function checkAndDeployFridaServer(deviceId: string, platform: 'and
       } else {
         // Verify host connectivity
         try {
-          await execPromise(`frida-ps ${fridaArgs}`);
+          await execPromise(`"${fpsBin}" ${fridaArgs}`, { timeout: 10000 });
           onLog('[Frida] Host can communicate with Frida Server.');
           return true;
         } catch (e) {
@@ -256,7 +269,7 @@ export async function checkAndDeployFridaServer(deviceId: string, platform: 'and
       
       // Verify host can connect
       try {
-        await execPromise(`frida-ps -D "${deviceId}"`, { timeout: 5000 });
+        await execPromise(`"${fpsBin}" -D "${deviceId}"`, { timeout: 5000 });
         onLog('[Frida] ✓ Host can communicate with Frida Server.');
         return true;
       } catch(e) {
@@ -274,11 +287,50 @@ export async function checkAndDeployFridaServer(deviceId: string, platform: 'and
 }
 
 // 使用 Frida 获取应用列表和图标
+// iOS 走 fridaClient（Node bindings，无 Python 依赖）；Android 保留原有多路径 fallback
 export async function fetchAppListViaFrida(deviceId: string, platform: 'android' | 'ios', onLog?: (msg: string) => void): Promise<FridaAppInfo[]> {
   const log = onLog || console.log;
-  
+
   log('[Frida] Starting app list fetch via Frida...');
-  
+
+  // ============== iOS 分支：直接用 npm frida ==============
+  if (platform === 'ios') {
+    log('[Frida] iOS 分支：使用内嵌 frida (Node bindings)，无需 Python');
+    // 只需要确认 device 端 frida-server 可达；不通就没辙（用户需要在 Sileo/Cydia 装 Frida）
+    const probe = await fridaClient.probeFridaAvailable(deviceId);
+    if (!probe.ok) {
+      log(`[Frida Error] 设备端 frida-server 不可达：${probe.reason}`);
+      log('[Frida Error] 请在设备的 Sileo/Cydia 中添加 https://build.frida.re 源并安装 Frida');
+      return [];
+    }
+    log(`[Frida] ✓ 设备端 frida-server 可达 (${probe.reason})`);
+
+    try {
+      const apps = await fridaClient.enumerateApplications(deviceId, { includeIcons: true, onlyUser: true });
+      log(`[Frida] ✓ Enumerated ${apps.length} user apps`);
+
+      const result: FridaAppInfo[] = apps.map((a) => ({
+        id: a.id,
+        name: a.name,
+        version: a.version || '',
+        icon: a.icon || '',
+      }));
+
+      // 保存图标到缓存
+      if (result.length > 0) {
+        saveIconsBatch(deviceId, platform, result.map((app) => ({
+          packageName: app.id,
+          icon: app.icon || '',
+        }))).catch((e) => log(`[Cache Warn] Failed to cache icons: ${e.message}`));
+      }
+      return result;
+    } catch (e: any) {
+      log(`[Frida Error] enumerateApplications 失败: ${e.message}`);
+      return [];
+    }
+  }
+
+  // ============== Android 分支：保持原有 Python + CLI 兼容 ==============
   // 1. 检查 Frida 是否安装
   const hasFrida = await checkFridaInstalled();
   if (!hasFrida) {
@@ -286,7 +338,7 @@ export async function fetchAppListViaFrida(deviceId: string, platform: 'android'
     return [];
   }
   log('[Frida] Frida tools found on host.');
-  
+
   // 2. 确保 Frida Server 已部署并运行
   log('[Frida] Checking and deploying Frida Server if needed...');
   const ready = await checkAndDeployFridaServer(deviceId, platform, log);
@@ -298,7 +350,7 @@ export async function fetchAppListViaFrida(deviceId: string, platform: 'android'
 
   // Debug: Log Frida version
   try {
-     const { stdout } = await execPromise('frida --version');
+     const { stdout } = await execPromise(`"${fridaCmd('frida')}" --version`);
      log(`[Frida] Host Frida Version: ${stdout.trim()}`);
   } catch(e) {}
 
@@ -546,7 +598,7 @@ except Exception as e:
 async function fetchAppListViaFridaPs(deviceId: string, platform: 'android' | 'ios', log: (msg: string) => void): Promise<FridaAppInfo[]> {
   try {
     // 使用 frida-ps -ai -j 获取已安装应用的 JSON 输出
-    const { stdout } = await execPromise(`frida-ps -D "${deviceId}" -ai -j`, { timeout: 10000 });
+    const { stdout } = await execPromise(`"${fridaCmd('frida-ps')}" -D "${deviceId}" -ai -j`, { timeout: 10000 });
     
     const apps = JSON.parse(stdout);
     log(`[Frida-ps] Parsed ${apps.length} apps from frida-ps`);
@@ -886,9 +938,10 @@ Java.perform(function() {
        
        const args = targetArgs;
        
-       log(`[Frida Debug] Spawning: frida ${args.join(' ')}`);
+       const fridaBin = fridaCmd('frida');
+       log(`[Frida Debug] Spawning: ${fridaBin} ${args.join(' ')}`);
        
-       const child = spawn('frida', args);
+       const child = spawn(fridaBin, args);
        
        let output = '';
        let result: FridaAppInfo[] = [];
@@ -1017,25 +1070,51 @@ Java.perform(function() {
 }
 
 export async function decryptApp(
-  options: DecryptOptions, 
+  options: DecryptOptions,
   onLog: (msg: string) => void
 ): Promise<string> {
   const { deviceId, platform, bundleId } = options;
   
   onLog(`[Init] 开始脱壳应用: ${bundleId}`);
   onLog(`[Init] 平台: ${platform}, 设备: ${deviceId}`);
-  
-  // 1. 检查 Frida 是否安装
+
+  // ============== iOS：走内嵌 frida (Node bindings)，无需 Python ==============
+  if (platform === 'ios') {
+    onLog('[Step 1/4] 探测设备端 frida-server...');
+    const probe = await fridaClient.probeFridaAvailable(deviceId);
+    if (!probe.ok) {
+      onLog(`[Error] 设备端 frida-server 不可达：${probe.reason}`);
+      onLog('[Info] 请在设备的 Sileo/Cydia 中添加 https://build.frida.re 源并安装 Frida');
+      throw new Error('Device-side frida-server not reachable: ' + probe.reason);
+    }
+    onLog(`[✓] frida-server 可达 (${probe.reason})`);
+
+    onLog('[Step 2/4] 确认设备越狱状态（用于建立 SSH，拉取 dumped 文件）...');
+    const { checkJailbreak } = await import('./iosSshService');
+    const isJb = await checkJailbreak(deviceId);
+    if (!isJb) {
+      throw new Error('设备越狱检测失败 —— 请先在文件管理或应用脱壳页点"我已确认越狱"以启用强制越狱模式');
+    }
+    onLog('[✓] 越狱确认，SSH 通道已就绪');
+
+    const outputDir = options.outputDir || path.join(os.tmpdir(), 'mktools_decrypt');
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+    onLog(`[✓] 输出目录: ${outputDir}`);
+
+    onLog('[Step 3/4] 开始脱壳进程...');
+    return await decryptIosAppNative(deviceId, bundleId, outputDir, onLog);
+  }
+
+  // ============== Android：保留原有 Python 脱壳（frida-dexdump）==============
   onLog('[Step 1/5] 检查 Frida 工具...');
   const hasFrida = await checkFridaInstalled();
   if (!hasFrida) {
     onLog('[Error] Frida 未安装或未在 PATH 中找到');
-    onLog('[Info] 请安装 Frida: pip install frida-tools');
+    onLog('[Info] Android 脱壳当前仍依赖 frida-dexdump (Python)，请安装：pip install frida-tools frida-dexdump');
     throw new Error('Frida not found. Please install: pip install frida-tools');
   }
   onLog('[✓] Frida 工具已安装');
 
-  // 2. 检查并部署 Frida Server
   onLog('[Step 2/5] 检查并部署 Frida Server...');
   const ready = await checkAndDeployFridaServer(deviceId, platform, onLog);
   if (!ready) {
@@ -1044,283 +1123,194 @@ export async function decryptApp(
   }
   onLog('[✓] Frida Server 已就绪');
 
-  // 3. 准备输出目录
   onLog('[Step 3/5] 准备输出目录...');
   const outputDir = options.outputDir || path.join(os.tmpdir(), 'mktools_decrypt');
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
   onLog(`[✓] 输出目录: ${outputDir}`);
 
-  // 4. 执行脱壳
   onLog('[Step 4/5] 开始脱壳进程...');
-  
-  if (platform === 'ios') {
-    // iOS 脱壳使用 frida-ios-dump
-    return await decryptIosApp(deviceId, bundleId, outputDir, onLog);
-  } else {
-    // Android 脱壳使用 frida-dexdump
-    return await decryptAndroidApp(deviceId, bundleId, outputDir, onLog);
-  }
+  return await decryptAndroidApp(deviceId, bundleId, outputDir, onLog);
 }
 
-// iOS 应用脱壳
-async function decryptIosApp(
+/**
+ * iOS 脱壳（原生 Node 版）：完全不依赖 Python
+ *
+ * 流程：
+ *  1. fridaClient.attachOrSpawn() 附加/拉起目标应用
+ *  2. loadScript(dump.js) 注入脱壳脚本；脚本会通过 send() 通知宿主每个 dumped 模块的路径 + 原始路径
+ *  3. 宿主用 SCP 从设备拉取 dumped .fid 文件到本地 tmp/Payload/
+ *  4. app 消息到达后，用 SCP -r 递归拉取整个 .app bundle 到 tmp/Payload/AppName.app/
+ *  5. done 消息到达后，把 .fid 文件覆盖到 .app 内对应位置（即"用解密后的可执行文件替换加密的"）
+ *  6. zip -qr Payload → 输出 IPA
+ */
+async function decryptIosAppNative(
   deviceId: string,
   bundleId: string,
   outputDir: string,
   onLog: (msg: string) => void
 ): Promise<string> {
-  const fridaPath = getFridaResourcePath();
-  const dumpScriptPath = path.join(fridaPath, 'frida-ios-dump', 'dump.py');
-  
-  if (!fs.existsSync(dumpScriptPath)) {
-    onLog(`[Error] iOS dump 脚本未找到: ${dumpScriptPath}`);
-    throw new Error('frida-ios-dump script not found');
+  const dumpJsPath = path.join(getFridaResourcePath(), 'frida-ios-dump', 'dump.js');
+  if (!fs.existsSync(dumpJsPath)) {
+    throw new Error(`dump.js 未找到: ${dumpJsPath}`);
+  }
+  const dumpJsSource = fs.readFileSync(dumpJsPath, 'utf-8');
+
+  const { downloadSshFile, downloadSshDirectory } = await import('./iosSshService');
+
+  // 准备临时目录：/tmp/mktools_dump_<ts>/Payload/
+  const tempRoot = path.join(os.tmpdir(), `mktools_dump_${Date.now()}`);
+  const payloadDir = path.join(tempRoot, 'Payload');
+  fs.mkdirSync(payloadDir, { recursive: true });
+  onLog(`[iOS] 临时目录: ${tempRoot}`);
+
+  // fidBaseName -> .app 内相对路径（例如 "Frameworks/Foo.framework/Foo"）
+  const fidToRelPath = new Map<string, string>();
+  let appBundleName = '';  // 例如 "MyApp.app"
+
+  // 1) attach + spawn
+  onLog(`[iOS] 附加/启动应用: ${bundleId}`);
+  const { session, appName, wasSpawned } = await fridaClient.attachOrSpawn(deviceId, bundleId, onLog);
+  onLog(`[iOS] ✓ 会话已建立 (app=${appName}, wasSpawned=${wasSpawned})`);
+
+  // 让 spawn 出来的应用有一点时间跑到 main，才能拿到全部模块
+  if (wasSpawned) {
+    await new Promise((r) => setTimeout(r, 1500));
   }
 
-  onLog('[iOS] 使用 frida-ios-dump 进行脱壳...');
-  onLog(`[iOS] 目标应用: ${bundleId}`);
-  
-  // 检测可用的 Python 命令（优先使用有 frida 模块的）
-  let pythonCmd = 'python3'; // 默认
+  let script: any = null;
   try {
-    // 尝试 python（优先）
-    try {
-      await execPromise('python -c "import frida"');
-      pythonCmd = 'python';
-      onLog('[iOS] 使用 python 命令（已有 frida 模块）');
-    } catch (e) {
-      // 尝试 python3
-      try {
-        await execPromise('python3 -c "import frida"');
-        pythonCmd = 'python3';
-        onLog('[iOS] 使用 python3 命令（已有 frida 模块）');
-      } catch (e2) {
-        onLog('[iOS Warn] Python 环境中未找到 frida 模块，尝试继续...');
-      }
-    }
-  } catch (e) {
-    onLog('[iOS Warn] 无法检测 Python 环境，使用默认 python3');
-  }
-  
-  // 检查并安装 frida-ios-dump 所需的依赖
-  onLog('[iOS] 检查 Python 依赖...');
-  const requiredModules = ['scp', 'paramiko'];
-  
-  for (const module of requiredModules) {
-    try {
-      await execPromise(`${pythonCmd} -c "import ${module}"`);
-      onLog(`[iOS] ✓ ${module} 模块已安装`);
-    } catch (e) {
-      onLog(`[iOS] 安装 ${module} 模块...`);
-      try {
-        await execPromise(`${pythonCmd} -m pip install ${module}`, { timeout: 60000 });
-        onLog(`[iOS] ✓ ${module} 安装成功`);
-      } catch (installError: any) {
-        onLog(`[iOS Warn] ${module} 安装失败: ${installError.message}`);
-        onLog(`[iOS] 请手动安装: ${pythonCmd} -m pip install ${module}`);
-      }
-    }
-  }
-  
-  // 确保 iproxy 正在运行（用于 SSH 连接）
-  onLog('[iOS] 设置 SSH 连接...');
-  try {
-    const { checkJailbreak, execSshCommand } = await import('./iosSshService');
-    const isJailbroken = await checkJailbreak(deviceId);
-    if (!isJailbroken) {
-      onLog('[iOS Error] 无法建立 SSH 连接，请确保设备已越狱且 iproxy 可用');
-      throw new Error('SSH connection failed');
-    }
-    onLog('[iOS] ✓ SSH 连接已建立');
-    
-    // 检查应用是否正在运行
-    onLog('[iOS] 检查目标应用状态...');
-    let isRunning = false;
-    try {
-      const psOutput = await execSshCommand(deviceId, `ps -A | grep -i "${bundleId}" | grep -v grep`);
-      if (psOutput && psOutput.trim()) {
-        onLog('[iOS] 应用正在运行，准备直接附加...');
-        isRunning = true;
-      } else {
-        onLog('[iOS] 应用未运行');
-      }
-    } catch (e) {
-      // 如果 grep 没找到进程，会返回错误，这是正常的
-      onLog('[iOS] 应用未运行');
-    }
+    // 2) 加载 dump.js，监听 send 消息
+    await new Promise<void>((resolve, reject) => {
+      const overallTimeout = setTimeout(() => {
+        reject(new Error('脱壳超时（10 分钟未完成）'));
+      }, 10 * 60 * 1000);
 
-    // 如果应用未运行，尝试通过 SSH 启动
-    if (!isRunning) {
-      onLog('[iOS] 尝试通过 SSH 启动应用...');
-      
-      const launchCommands = [
-        `open ${bundleId}`,
-        `/usr/bin/open ${bundleId}`,
-        `uiopen ${bundleId}`,
-        `/usr/bin/uiopen ${bundleId}`
-      ];
+      // 并发下载，但用一个内部队列保证 done 消息前所有下载都完成
+      const pending: Array<Promise<any>> = [];
 
-      let launchSuccess = false;
-      
-      for (const cmd of launchCommands) {
+      const onScriptMessage = (message: any, _data?: Buffer | null) => {
+        if (message.type === 'error') {
+          onLog(`[dump.js Error] ${message.description}`);
+          if (message.stack) onLog(`[dump.js Stack] ${message.stack}`);
+          return;
+        }
+        const payload = message.payload;
+        if (!payload || typeof payload !== 'object') return;
+
+        // 单个 dumped 模块（主二进制 或 dylib/framework）
+        if (payload.dump && payload.path) {
+          const fidRemote: string = payload.dump;
+          const originPath: string = payload.path;
+          const fidBase = path.posix.basename(fidRemote);
+          const idx = originPath.indexOf('.app/');
+          const relInApp = idx >= 0 ? originPath.slice(idx + 5) : fidBase;
+          fidToRelPath.set(fidBase, relInApp);
+
+          onLog(`[dump] 拉取 ${fidBase} -> ${relInApp}`);
+          const p = downloadSshFile(deviceId, fidRemote, path.join(payloadDir, fidBase))
+            .catch((e) => onLog(`[dump Warn] 下载 ${fidBase} 失败: ${e.message}`));
+          pending.push(p);
+          return;
+        }
+
+        // 整个 .app bundle
+        if (payload.app) {
+          const appPath: string = payload.app;
+          appBundleName = path.posix.basename(appPath);
+          onLog(`[dump] 递归拉取 app bundle: ${appBundleName}（可能需要几分钟）...`);
+          const p = downloadSshDirectory(deviceId, appPath, path.join(payloadDir, appBundleName))
+            .catch((e) => onLog(`[dump Warn] 下载 app bundle 失败: ${e.message}`));
+          pending.push(p);
+          return;
+        }
+
+        // 完成信号：等待所有下载完毕后 resolve
+        if (payload.done !== undefined) {
+          clearTimeout(overallTimeout);
+          onLog(`[dump] dump.js 端已完成，等待 ${pending.length} 个下载任务收尾...`);
+          Promise.allSettled(pending).then(() => resolve());
+        }
+      };
+
+      (async () => {
         try {
-          onLog(`[iOS Debug] 尝试启动命令: ${cmd}`);
-          await execSshCommand(deviceId, cmd);
-          // 等待应用启动
-          await new Promise(r => setTimeout(r, 3000));
-          
-          // 检查是否成功启动
-          const psOutput = await execSshCommand(deviceId, `ps -A | grep -i "${bundleId}" | grep -v grep`);
-          if (psOutput && psOutput.trim()) {
-            onLog('[iOS] 应用已通过 SSH 启动');
-            launchSuccess = true;
-            break;
-          }
-        } catch (e) {
-          // 忽略单个命令的失败
+          script = await fridaClient.loadScript(session, dumpJsSource, onScriptMessage);
+          onLog('[iOS] ✓ dump.js 已注入');
+          // 触发 dump.js 的 recv(handleMessage)：post 任意消息即可
+          script.post({ type: 'dump' });
+        } catch (e: any) {
+          clearTimeout(overallTimeout);
+          reject(e);
         }
-      }
+      })();
+    });
 
-      if (!launchSuccess) {
-        onLog('[iOS Warn] SSH 启动应用失败，将尝试由 dump.py 启动 (可能会因签名问题失败)...');
-        onLog('[iOS] 建议手动在设备上打开目标应用，然后重试');
-      }
+    onLog('[iOS] ✓ dump 完成');
+  } finally {
+    if (script) {
+      try { await script.unload(); } catch { /* ignore */ }
     }
-  } catch (e: any) {
-    onLog(`[iOS Error] SSH 连接失败: ${e.message}`);
-    throw e;
+    try { await session.detach(); } catch { /* ignore */ }
   }
-  
+
+  if (!appBundleName) {
+    throw new Error('未收到 app bundle 消息，可能是 dump.js 尚未完成或应用崩溃');
+  }
+  const appBundlePath = path.join(payloadDir, appBundleName);
+  if (!fs.existsSync(appBundlePath)) {
+    throw new Error(`app bundle 目录不存在: ${appBundlePath}`);
+  }
+
+  // 3) 用 .fid 覆盖 .app 内对应位置
+  onLog('[iOS] 用解密后的 .fid 文件覆盖 .app bundle 内对应位置...');
+  let replacedCount = 0;
+  for (const [fidName, relInApp] of fidToRelPath) {
+    const fidPath = path.join(payloadDir, fidName);
+    const targetPath = path.join(appBundlePath, relInApp);
+    if (!fs.existsSync(fidPath)) {
+      onLog(`[dump Warn] 跳过（.fid 不存在）: ${fidName}`);
+      continue;
+    }
+    try {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.copyFileSync(fidPath, targetPath);
+      fs.unlinkSync(fidPath);
+      replacedCount++;
+    } catch (e: any) {
+      onLog(`[dump Warn] 覆盖失败 ${relInApp}: ${e.message}`);
+    }
+  }
+  onLog(`[iOS] ✓ 已覆盖 ${replacedCount} 个可执行/framework 文件`);
+
+  // 4) zip Payload → .ipa
+  const dateStr = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+  const ipaFileName = `${bundleId}_${dateStr}.ipa`;
+  const ipaPath = path.join(outputDir, ipaFileName);
+
+  onLog(`[iOS] 打包 IPA: ${ipaPath}`);
   try {
-    // 执行 dump.py 脚本
-    // 注意：dump.py 的 -o 参数是输出文件名（不含.ipa后缀），不是目录
-    // 我们需要构造完整的输出文件路径
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
-    const outputFileName = `${bundleId}_${timestamp}`;
-    const outputFilePath = path.join(outputDir, outputFileName);
-    
-    // 添加 SSH 参数：-H localhost -p 2222 -u root -P alpine
-    const args = [
-      dumpScriptPath,
-      '-H', 'localhost',
-      '-p', '2222',
-      '-u', 'root',
-      '-P', 'alpine',
-      '-o', outputFilePath,  // 使用完整路径（不含.ipa后缀）
-      bundleId
-    ];
-    
-    const cmd = `${pythonCmd} "${dumpScriptPath}" -H localhost -p 2222 -u root -P alpine -o "${outputFilePath}" "${bundleId}"`;
-    onLog(`[iOS] 执行命令: ${cmd}`);
-    
-    const { spawn } = require('node:child_process');
-    const child = spawn(pythonCmd, args);
-    
-    return await new Promise<string>((resolve, reject) => {
-      let outputPath = '';
-      let hasError = false;
-      
-      child.stdout.on('data', (data: any) => {
-        const str = data.toString();
-        onLog(`[iOS] ${str.trim()}`);
-        
-        // 尝试从输出中提取文件路径
-        // 可能的格式：
-        // - Saved to /path/to/file.ipa
-        // - Generating "xxx.ipa"
-        const savedMatch = str.match(/Saved to (.+\.ipa)/);
-        const generatingMatch = str.match(/Generating "(.+\.ipa)"/);
-        
-        if (savedMatch) {
-          outputPath = savedMatch[1];
-        } else if (generatingMatch && !outputPath) {
-          // 如果看到 Generating，记录预期的文件名
-          const ipaName = generatingMatch[1];
-          // 如果是相对路径，转换为绝对路径
-          if (!path.isAbsolute(ipaName)) {
-            outputPath = path.join(outputDir, ipaName);
-          } else {
-            outputPath = ipaName;
-          }
-        }
-      });
-      
-      child.stderr.on('data', (data: any) => {
-        const str = data.toString();
-        // 过滤掉 SyntaxWarning、进度条输出和 Python 源代码行
-        if (!str.includes('SyntaxWarning') && 
-            !str.includes('invalid escape sequence') &&
-            !str.match(/^\s*(output_ipa|import|from|def|class)\s*[=:]/) &&  // Python 代码行
-            !str.includes('[00:') &&  // 进度条时间
-            !str.includes('MB/s') &&  // 进度条速度
-            !str.match(/\d+%\|/)) {   // 进度条百分比
-          onLog(`[iOS Error] ${str.trim()}`);
-          if (str.toLowerCase().includes('error') || str.toLowerCase().includes('failed')) {
-            hasError = true;
-          }
-        }
-      });
-      
-      child.on('close', (code: any) => {
-        if (code === 0 && !hasError) {
-          // 成功完成
-          if (outputPath && fs.existsSync(outputPath)) {
-            onLog('[✓] iOS 应用脱壳完成');
-            resolve(outputPath);
-          } else {
-            // 尝试查找生成的 IPA 文件
-            onLog('[iOS] 查找生成的 IPA 文件...');
-            try {
-              // 检查输出目录中的 IPA 文件
-              const files = fs.readdirSync(outputDir).filter(f => f.endsWith('.ipa'));
-              if (files.length > 0) {
-                // 按修改时间排序，获取最新的
-                const latestFile = files
-                  .map(f => ({
-                    name: f,
-                    path: path.join(outputDir, f),
-                    mtime: fs.statSync(path.join(outputDir, f)).mtime
-                  }))
-                  .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0];
-                
-                outputPath = latestFile.path;
-                onLog(`[✓] 找到脱壳文件: ${outputPath}`);
-                resolve(outputPath);
-              } else {
-                // 检查是否生成了 outputFilePath.ipa
-                const expectedPath = `${outputFilePath}.ipa`;
-                if (fs.existsSync(expectedPath)) {
-                  onLog(`[✓] 脱壳完成: ${expectedPath}`);
-                  resolve(expectedPath);
-                } else {
-                  onLog(`[Error] 未找到输出文件，预期路径: ${expectedPath}`);
-                  onLog(`[Error] 输出目录: ${outputDir}`);
-                  reject(new Error('Decryption completed but output file not found'));
-                }
-              }
-            } catch (e: any) {
-              onLog(`[Error] 查找输出文件失败: ${e.message}`);
-              reject(new Error('Decryption completed but output file not found'));
-            }
-          }
-        } else {
-          reject(new Error(`Decryption failed with code ${code}`));
-        }
-      });
-      
-      // 超时 20 分钟（大型应用需要更长时间）
-      setTimeout(() => {
-        child.kill();
-        reject(new Error('Decryption timeout (20 minutes)'));
-      }, 20 * 60 * 1000);
+    await execPromise(`cd "${tempRoot}" && zip -qr "${ipaPath}" Payload`, {
+      timeout: 5 * 60 * 1000,
+      maxBuffer: 20 * 1024 * 1024,
     });
   } catch (e: any) {
-    onLog(`[Error] iOS 脱壳失败: ${e.message}`);
-    throw e;
+    throw new Error(`zip 打包失败: ${e.message}`);
   }
+
+  // 5) 清理临时目录
+  try {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  } catch {
+    /* ignore cleanup errors */
+  }
+
+  onLog(`[✓] iOS 脱壳完成: ${ipaPath}`);
+  return ipaPath;
 }
+
+// 旧的 iOS 脱壳实现（基于 python dump.py）已经被 decryptIosAppNative 完全取代 —— 不再引用。
+// 保留 dump.py / dump.js 是因为 dump.js 是 Frida agent 脚本（运行在设备端），我们的
+// Node 版通过 loadScript 注入它。dump.py 不再使用，可以删除但影响不大。
 
 // 提取 iOS 应用的 header 文件
 export async function extractIosHeaders(
@@ -1587,7 +1577,8 @@ async function decryptAndroidApp(
 
     return new Promise<string>((resolve, reject) => {
       const { spawn } = require('node:child_process');
-      const child = spawn('frida-dexdump', args);
+      const dxBin = resolveExecutable('frida-dexdump') || 'frida-dexdump';
+      const child = spawn(dxBin, args);
       let hasError = false;
       let outputCount = 0;
 

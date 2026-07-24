@@ -48,9 +48,15 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
   // 判断错误是否为「权限受限」类，用于避免弹全局错误 toast，改为在列表区域显示友好占位符
+  // 覆盖：Android (Permission denied) / iOS 越狱设备沙箱受限目录 (Operation not permitted)
   const isPermissionError = (msg: string | undefined): boolean => {
     if (!msg) return false;
-    return msg.includes('Permission denied') || msg.includes('无权限');
+    return (
+      msg.includes('Permission denied') ||
+      msg.includes('Operation not permitted') ||
+      msg.includes('无权限') ||
+      msg.includes('cannot open directory')
+    );
   };
 
   // 检查选中的文件是否是可安装的应用包
@@ -90,6 +96,10 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
     setExpandedPaths(new Set());
     setIsJailbroken(false);
     setInitializing(false);
+    // 切换设备时清除手动强制越狱标记（避免把 A 设备的确认套用到 B 设备）
+    if (deviceId && platform === 'ios') {
+      window.ipcRenderer.invoke('unset-forced-jailbreak', { deviceId }).catch(() => {});
+    }
     
     if (platform === 'ios' && deviceId) {
       // iOS 设备：检查越狱状态，然后加载目录
@@ -125,6 +135,48 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
     }
   }, [deviceId, platform, basePath]);
 
+  // 手动强制以越狱模式访问：清除缓存 → 登记强制标记 → 重新加载根目录
+  const forceJailbrokenMode = async () => {
+    if (!deviceId) return;
+    try {
+      setInitializing(true);
+      await window.ipcRenderer.invoke('clear-jailbreak-cache', { deviceId });
+      await window.ipcRenderer.invoke('set-forced-jailbreak', { deviceId, password: 'alpine', remotePort: 22 });
+      setIsJailbroken(true);
+      // 重置状态，重新加载
+      setTreeData([]);
+      setEntries([]);
+      setSelectedPath('');
+      setSelected(null);
+      await loadRootTree();
+    } catch (e: any) {
+      onError(`切换到越狱模式失败: ${e?.message || e}`);
+    } finally {
+      setInitializing(false);
+    }
+  };
+
+  // 重新自动检测（清缓存 → 重新走 checkJailbreak）
+  const recheckJailbreak = async () => {
+    if (!deviceId) return;
+    try {
+      setInitializing(true);
+      await window.ipcRenderer.invoke('unset-forced-jailbreak', { deviceId });
+      await window.ipcRenderer.invoke('clear-jailbreak-cache', { deviceId });
+      const jailbroken = await window.ipcRenderer.invoke('check-jailbreak', { deviceId });
+      setIsJailbroken(jailbroken);
+      setTreeData([]);
+      setEntries([]);
+      setSelectedPath('');
+      setSelected(null);
+      await loadRootTree();
+    } catch (e: any) {
+      onError(`重新检测越狱状态失败: ${e?.message || e}`);
+    } finally {
+      setInitializing(false);
+    }
+  };
+
   const loadRootTree = async () => {
     if (!deviceId) return;
     // 对于 iOS，如果没有 bundleId（系统根目录模式），也允许加载
@@ -133,14 +185,21 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
     setLoading(true);
     try {
       const rootPath = platform === 'android' ? '/' : '/';
-      const list = await window.ipcRenderer.invoke('fs-list', { 
-        deviceId, 
-        platform, 
-        path: rootPath, 
+      const list = await window.ipcRenderer.invoke('fs-list', {
+        deviceId,
+        platform,
+        path: rootPath,
         bundleId: bundleId || undefined,  // 如果是空字符串，传 undefined
         skipSymlinkResolution: false  // 左侧目录树需要解析符号链接，过滤无效的
       });
-      
+
+      // 后端将"权限受限"作为业务结果返回（非数组），根目录都读不了就直接置空
+      if (list && !Array.isArray(list) && list.permissionDenied) {
+        console.warn(`[FileManager] Root dir permission denied: ${list.message}`);
+        setTreeData([]);
+        return;
+      }
+
       const dirs = (list || []).filter((e: FileEntry) => e.isDir);
       
       const nodes: TreeNode[] = dirs.map((e: FileEntry) => {
@@ -201,13 +260,28 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
         bundleId: bundleId || undefined,  // 如果是空字符串，传 undefined
         skipSymlinkResolution: false  // 右侧文件列表需要解析符号链接，显示最终地址
       });
+
+      // 后端将权限受限当作业务结果返回（非数组，避免抛异常引发主进程 stdout 噪音）
+      if (list && !Array.isArray(list) && list.permissionDenied) {
+        const hint = platform === 'ios'
+          ? '该目录受 iOS Sandbox / TCC 保护，即使 root 也无法通过 SSH 直接读取（例如 /.fseventsd、/.Spotlight-V100、/var/db/* 等）。'
+          : '该目录被 Android 系统保护，普通 ADB Shell 无法读取。';
+        setPermissionError(hint);
+        setEntries([]);
+        setSelected(null);
+        return;
+      }
+
       setEntries(list || []);
       setSelected(null);
     } catch (e: any) {
       const msg = e?.message || '加载目录内容失败';
-      // 权限受限时：在文件列表区域显示友好占位符，不弹全局错误 toast，避免每次点击都被打断
+      // 兼容：万一有历史路径还在走异常分支（例如底层 AFC 直接 throw），仍然做一次识别
       if (isPermissionError(msg)) {
-        setPermissionError('该目录被系统保护，普通 ADB Shell 无法读取。');
+        const hint = platform === 'ios'
+          ? '该目录受 iOS Sandbox / TCC 保护，即使 root 也无法通过 SSH 直接读取（例如 /.fseventsd、/.Spotlight-V100、/var/db/* 等）。'
+          : '该目录被 Android 系统保护，普通 ADB Shell 无法读取。';
+        setPermissionError(hint);
         setEntries([]);
         setSelected(null);
       } else {
@@ -228,14 +302,20 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
       // 如果是符号链接且有解析后的路径，使用解析后的路径
       const targetPath = node.resolvedPath || node.path;
       
-      const list = await window.ipcRenderer.invoke('fs-list', { 
-        deviceId, 
-        platform, 
-        path: targetPath, 
+      const list = await window.ipcRenderer.invoke('fs-list', {
+        deviceId,
+        platform,
+        path: targetPath,
         bundleId: bundleId || undefined,  // 如果是空字符串，传 undefined
         skipSymlinkResolution: false  // 左侧目录树需要解析符号链接，过滤无效的
       });
-      
+
+      // 权限受限：静默返回，让该节点展开为"空"，不影响树的其他分支
+      if (list && !Array.isArray(list) && list.permissionDenied) {
+        console.warn(`[FileManager] Tree expand permission denied: ${targetPath}`);
+        return;
+      }
+
       const dirs = (list || []).filter((e: FileEntry) => e.isDir);
       const children: TreeNode[] = dirs.map((e: FileEntry) => {
         // 特殊处理 .. 父目录
@@ -878,12 +958,15 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
               </span>
             </div>
             
-            {/* iOS 目录说明 */}
-            {platform === 'ios' && deviceId && !initializing && treeData.length > 0 && (
+            {/*
+             * iOS 目录说明卡片：
+             * - 已识别为越狱 → 不显示任何提示（跟 Android 侧完全一致，直接看目录树即可）
+             * - 未识别为越狱 → 保留卡片，因为里面有"我已确认越狱，强制访问根目录 /"的唯一入口
+             *   (自动检测偶尔会漏检，用户需要一个手动强制通道)
+             */}
+            {platform === 'ios' && deviceId && !initializing && treeData.length > 0 && !isJailbroken && (
               <div className={`px-3 py-2 rounded-lg text-[10px] ${
-                isJailbroken 
-                  ? (isDark ? 'bg-green-900/20 text-green-400 border border-green-800/30' : 'bg-green-50 text-green-700 border border-green-200')
-                  : (isDark ? 'bg-blue-900/20 text-blue-400 border border-blue-800/30' : 'bg-blue-50 text-blue-700 border border-blue-200')
+                isDark ? 'bg-blue-900/20 text-blue-400 border border-blue-800/30' : 'bg-blue-50 text-blue-700 border border-blue-200'
               }`}>
                 <div className="flex items-start gap-2">
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 mt-0.5">
@@ -892,23 +975,38 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
                     <line x1="12" y1="8" x2="12.01" y2="8"></line>
                   </svg>
                   <div className="flex-1">
-                    <div className="font-bold mb-1">{isJailbroken ? '系统根目录' : '媒体目录'}</div>
+                    <div className="font-bold mb-1">媒体目录</div>
                     <div className="opacity-80 leading-relaxed">
-                      {isJailbroken ? (
-                        <>
-                          当前访问: 完整文件系统
-                          <br />
-                          设备已越狱，可访问所有系统文件
-                        </>
-                      ) : (
-                        <>
-                          当前访问: /var/mobile/Media
-                          <br />
-                          包含照片、下载、音乐等文件
-                        </>
-                      )}
+                      当前访问: /var/mobile/Media
+                      <br />
+                      包含照片、下载、音乐等文件
                     </div>
                   </div>
+                </div>
+
+                <div className="mt-2 pt-2 border-t border-current/10 flex flex-col gap-1.5">
+                  <button
+                    onClick={forceJailbrokenMode}
+                    className={`w-full text-[10px] font-semibold px-2 py-1.5 rounded-md transition-all ${
+                      isDark
+                        ? 'bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+                        : 'bg-amber-50 border border-amber-200 text-amber-700 hover:bg-amber-100'
+                    }`}
+                    title="跳过自动检测，直接以越狱模式（默认 SSH 22 端口, 密码 alpine）访问根目录"
+                  >
+                    我已确认越狱，强制访问根目录 /
+                  </button>
+                  <button
+                    onClick={recheckJailbreak}
+                    className={`w-full text-[10px] font-medium px-2 py-1.5 rounded-md transition-all ${
+                      isDark
+                        ? 'bg-transparent border border-current/20 text-current/80 hover:bg-current/5'
+                        : 'bg-transparent border border-current/20 text-current/80 hover:bg-current/5'
+                    }`}
+                    title="清除缓存并重新执行自动检测"
+                  >
+                    重新检测越狱状态
+                  </button>
                 </div>
               </div>
             )}
@@ -1181,7 +1279,9 @@ export const FileManager: React.FC<FileManagerProps> = ({ deviceId, platform, th
                   {selectedPath}
                 </p>
                 <p className={`text-[10px] mt-4 ${isDark ? 'text-zinc-500' : 'text-slate-500'}`}>
-                  提示：此目录受 Android 系统保护，需 root 或 debug 版系统才能访问
+                  {platform === 'ios'
+                    ? '提示：iOS 越狱设备下部分系统目录仍受 Sandbox/TCC 限制，即使 root 也无法读取，属正常现象'
+                    : '提示：此目录受 Android 系统保护，需 root 或 debug 版系统才能访问'}
                 </p>
               </div>
             </div>

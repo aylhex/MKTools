@@ -7,7 +7,7 @@ import { URL as NodeURL } from 'node:url'
 import { fixPath } from './utils/env'
 import { getDevices, getAndroidApps, getAndroidAppIcon, getAndroidPackagePids, checkAndroidRoot } from './services/deviceService'
 import { startLogging, stopLogging } from './services/logService'
-import { listDirectory, downloadFile, downloadFileToTemp, deleteTarget, mkdir, upload, listIosApps, renameFile, createFile, checkJailbreak, getIosAppIcon } from './services/fileService'
+import { listDirectory, downloadFile, downloadFileToTemp, deleteTarget, mkdir, upload, listIosApps, renameFile, createFile, checkJailbreak, getIosAppIcon, clearJailbreakCache, setForcedJailbreak, unsetForcedJailbreak } from './services/fileService'
 import { getKeystoreAliases, analyzeApk, resignApk, getIosIdentities, resignIpa, injectAndResignApk, decompileApkForEdit, resignFromDecompiled, cleanupDecompileSession, DecompileSession } from './services/signerService'
 import { installApp, installAppFromDevice } from './services/installService'
 import { stopAllIproxy } from './services/iosSshService'
@@ -464,7 +464,20 @@ function setupIpcHandlers() {
   // File System Handlers
   try {
     safeHandle('fs-list', async (_event, args: { deviceId: string; platform: 'android' | 'ios'; path: string, bundleId?: string, skipSymlinkResolution?: boolean }) => {
-      return await listDirectory(args, args.skipSymlinkResolution || false);
+      try {
+        return await listDirectory(args, args.skipSymlinkResolution || false);
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        // 权限受限（Android: Permission denied / iOS: Operation not permitted）当作合法业务结果返回，
+        // 让前端展示琥珀色友好卡片；不再作为异常抛出，避免 Electron 在主进程 stdout 打印
+        // "Error occurred in handler for 'fs-list'" 噪音日志。
+        // 返回一个非数组的结构体，前端用 Array.isArray 判断是否是"权限受限"响应。
+        if (/Permission denied|Operation not permitted|cannot open directory/i.test(msg)) {
+          console.log(`[fs-list] Permission denied for ${args.path}: ${msg.slice(0, 200)}`);
+          return { permissionDenied: true, message: msg, path: args.path };
+        }
+        throw err;
+      }
     })
 
     safeHandle('fs-download', async (event, args: { deviceId: string; platform: 'android' | 'ios'; remotePath: string, bundleId?: string }) => {
@@ -534,6 +547,26 @@ function setupIpcHandlers() {
     safeHandle('check-jailbreak', async (_event, args: { deviceId: string }) => {
       return await checkJailbreak(args.deviceId);
     })
+
+    // 清除某设备（或全部）的越狱检测缓存，供 UI 手动重新检测
+    safeHandle('clear-jailbreak-cache', async (_event, args: { deviceId?: string }) => {
+      clearJailbreakCache(args?.deviceId);
+      return true;
+    })
+
+    // 用户手动标记设备为已越狱（"我确认已越狱，跳过自动检测"）
+    // 可选传入 SSH 密码 / remotePort，供文件管理直接以越狱模式访问根目录
+    safeHandle('set-forced-jailbreak', async (_event, args: { deviceId: string; password?: string; remotePort?: number }) => {
+      await setForcedJailbreak(args.deviceId, { password: args.password, remotePort: args.remotePort });
+      return true;
+    })
+
+    // 清除手动越狱标记，恢复自动检测
+    safeHandle('unset-forced-jailbreak', async (_event, args: { deviceId: string }) => {
+      unsetForcedJailbreak(args.deviceId);
+      return true;
+    })
+
     console.log('[IPC] Registered: File System handlers');
   } catch (e) {
     console.error('[IPC] Failed to register File System handlers:', e);

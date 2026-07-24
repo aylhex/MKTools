@@ -12,10 +12,17 @@ const execPromise = util.promisify(exec);
 
 // 存储设备的越狱状态
 const jailbreakCache = new Map<string, boolean>();
+// 用户手动强制标记为越狱的设备（override 自动检测结果）
+const forcedJailbreak = new Set<string>();
 
 // ============ iOS File Service Functions (inlined) ============
 // 检测设备是否越狱
 async function isDeviceJailbroken(deviceId: string): Promise<boolean> {
+  // 手动强制模式优先
+  if (forcedJailbreak.has(deviceId)) {
+    console.log(`[Jailbreak] Forced-jailbroken mode active for ${deviceId}`);
+    return true;
+  }
   // 检查缓存
   if (jailbreakCache.has(deviceId)) {
     const cached = jailbreakCache.get(deviceId)!;
@@ -40,6 +47,38 @@ export async function checkJailbreak(deviceId: string): Promise<boolean> {
   const result = await isDeviceJailbroken(deviceId);
   console.log(`[Jailbreak IPC] Result: ${result}`);
   return result;
+}
+
+// 清除缓存（供 UI 手动重新检测使用）
+export function clearJailbreakCache(deviceId?: string): void {
+  if (deviceId) {
+    jailbreakCache.delete(deviceId);
+    console.log(`[Jailbreak] Cache cleared for ${deviceId}`);
+  } else {
+    jailbreakCache.clear();
+    console.log(`[Jailbreak] All cache cleared`);
+  }
+}
+
+// 用户手动标记设备为越狱（例如"我确认已越狱，跳过自动检测"）
+// 同时会顺带清一次缓存并尝试在 iosSshService 里建立 SSH 连接参数，
+// 后续 SSH 相关操作就能直接走越狱设备路径。
+export async function setForcedJailbreak(deviceId: string, opts?: { password?: string; remotePort?: number }): Promise<void> {
+  forcedJailbreak.add(deviceId);
+  jailbreakCache.set(deviceId, true);
+  try {
+    await iosSshService.setForcedJailbreak(deviceId, opts);
+    console.log(`[Jailbreak] Forced jailbreak set for ${deviceId} (SSH conn established)`);
+  } catch (e: any) {
+    // SSH 建立失败也不阻断：至少 forcedJailbreak 标记生效
+    console.log(`[Jailbreak] Forced flag set for ${deviceId} but SSH setup failed: ${e.message}`);
+  }
+}
+
+export function unsetForcedJailbreak(deviceId: string): void {
+  forcedJailbreak.delete(deviceId);
+  jailbreakCache.delete(deviceId);
+  console.log(`[Jailbreak] Forced jailbreak cleared for ${deviceId}`);
 }
 
 // 获取 AFC 服务
@@ -176,8 +215,25 @@ async function downloadIosFile(deviceId: string, bundleId: string | undefined, r
   if (!bundleId) {
     const isJailbroken = await isDeviceJailbroken(deviceId);
     if (isJailbroken) {
-      // 越狱设备：使用 SSH 下载
-      await iosSshService.downloadSshFile(deviceId, remotePath, localPath);
+      // 越狱设备：先判断远端目标是文件还是目录
+      // iOS 上有大量 .app / .framework / .bundle 都是目录，用户看起来像"文件"但 scp 单文件会失败
+      let isDir = false;
+      try {
+        const out = await iosSshService.execSshCommand(
+          deviceId,
+          `[ -d '${remotePath.replace(/'/g, "'\\''")}' ] && echo dir || echo file`
+        );
+        isDir = out.trim() === 'dir';
+      } catch (e) {
+        // 判定失败时按文件处理，让 downloadSshFile 自己去报更清晰的错
+      }
+
+      if (isDir) {
+        // 递归下载整个目录（.app / .framework 等 bundle）
+        await iosSshService.downloadSshDirectory(deviceId, remotePath, localPath);
+      } else {
+        await iosSshService.downloadSshFile(deviceId, remotePath, localPath);
+      }
       return;
     }
   }

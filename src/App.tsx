@@ -5,7 +5,8 @@ import { FileManager } from './components/FileManager';
 import { AppSigner } from './components/AppSigner';
 import { AppDecrypt } from './components/AppDecrypt';
 import { AppRequest } from './components/AppRequest';
-import { Device, LogEntry, FilterState, Theme } from './types';
+import { Device, LogEntry, FilterState, Theme, IosFilterState } from './types';
+import { matchLogEntry } from './utils/iosFilter';
 import { AlertTriangle, X, FilterX, Sun, Moon, Terminal } from 'lucide-react';
 
 // 前端保留的最大日志条数（大容量环形缓冲）。
@@ -134,6 +135,12 @@ function App() {
     pid: '',
     search: '',
     package: ''
+  });
+
+  // iOS 平台使用独立的 Console 风格过滤器（顶部工具栏 + chip 化）
+  const [iosFilters, setIosFilters] = useState<IosFilterState>({
+    category: 'any',
+    filters: [],
   });
 
   // Android 应用列表（用于按包名过滤下拉）
@@ -354,6 +361,11 @@ function App() {
   };
 
   const filteredLogs = useMemo(() => {
+    // iOS 走全新的 Console 风格过滤器（顶部工具栏），不复用 Android 侧栏的 FilterState
+    if (selectedPlatform === 'ios') {
+      return logs.filter(log => matchLogEntry(log, iosFilters));
+    }
+
     const { level, tag, pid, search } = filters;
     const normalizedTag = tag.trim();
     const normalizedPid = pid.trim();
@@ -415,7 +427,20 @@ function App() {
 
       return true;
     });
-  }, [logs, filters, selectedPlatform, packagePids]);
+  }, [logs, filters, selectedPlatform, packagePids, iosFilters]);
+
+  // iOS 侧的搜索高亮：用 iosFilters 里最新一个 message/any 类的正向 contains 值
+  const iosHighlightKeyword = useMemo(() => {
+    if (selectedPlatform !== 'ios') return '';
+    for (let i = iosFilters.filters.length - 1; i >= 0; i--) {
+      const f = iosFilters.filters[i];
+      if (f.disabled) continue;
+      if ((f.field === 'message' || f.field === 'any') && (f.op === 'contains' || f.op === 'regex') && f.value) {
+        return f.value;
+      }
+    }
+    return '';
+  }, [selectedPlatform, iosFilters]);
 
   return (
     <div className={`flex flex-col h-screen w-screen overflow-hidden ${theme === 'dark' ? 'bg-zinc-950 text-zinc-200' : 'bg-slate-50 text-slate-900'}`}>
@@ -694,6 +719,10 @@ function App() {
             showDeviceSelect={false}
             showTitle={false}
             showThemeToggle={false}
+            iosFilters={iosFilters}
+            onIosFilterChange={setIosFilters}
+            iosTotalCount={logs.length}
+            iosMatchedCount={filteredLogs.length}
           />
           <div className="flex-1 flex flex-col h-full overflow-hidden relative">
             <div className="flex-1 relative">
@@ -710,7 +739,13 @@ function App() {
                       <p className={`text-xs mt-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-slate-500'}`}>请调整过滤条件以查看更多日志</p>
                     </div>
                     <button
-                      onClick={() => setFilters({ level: 'V', tag: '', pid: '', search: '', package: '' })}
+                      onClick={() => {
+                        if (selectedPlatform === 'ios') {
+                          setIosFilters({ category: 'any', filters: [] });
+                        } else {
+                          setFilters({ level: 'V', tag: '', pid: '', search: '', package: '' });
+                        }
+                      }}
                       className="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all pointer-events-auto active:scale-95"
                     >
                       重置所有过滤器
@@ -732,7 +767,7 @@ function App() {
                 onClearLogs={handleClearLogs}
                 hasSelectedDevice={!!selectedDevice}
                 isLogging={isLogging}
-                highlight={filters.search}
+                highlight={selectedPlatform === 'ios' ? iosHighlightKeyword : filters.search}
               />
             </div>
           </div>

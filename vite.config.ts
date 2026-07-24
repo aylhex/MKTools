@@ -14,7 +14,7 @@ export default defineConfig({
         vite: {
           build: {
             rollupOptions: {
-              external: ['appium-ios-device'],
+              external: ['appium-ios-device', 'frida'],
             },
           },
         },

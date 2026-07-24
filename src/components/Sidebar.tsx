@@ -1,6 +1,7 @@
 import React from 'react';
-import { Device, FilterState, Theme } from '../types';
+import { Device, FilterState, IosFilterState, Theme } from '../types';
 import { Play, Square, Smartphone, Trash2, Search, Hash, Tag, Filter, Apple, Smartphone as AndroidIcon, Sun, Moon, ChevronLeft, ChevronRight, Terminal, Activity, Package } from 'lucide-react';
+import { IosLogFilterBar } from './IosLogFilterBar';
 
 interface SidebarProps {
   devices: Device[];
@@ -20,6 +21,11 @@ interface SidebarProps {
   showDeviceSelect?: boolean;
   showTitle?: boolean;
   showThemeToggle?: boolean;
+  // iOS 平台专用：Console 风格过滤器
+  iosFilters?: IosFilterState;
+  onIosFilterChange?: (state: IosFilterState) => void;
+  iosTotalCount?: number;
+  iosMatchedCount?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -39,7 +45,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
   showDeviceSelect = true,
   showTitle = true,
-  showThemeToggle = true
+  showThemeToggle = true,
+  iosFilters,
+  onIosFilterChange,
+  iosTotalCount = 0,
+  iosMatchedCount = 0,
 }) => {
   const isDark = theme === 'dark';
   const bgColor = isDark ? 'bg-zinc-900' : 'bg-white';
@@ -160,6 +170,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       <div className="flex-1 overflow-y-auto px-5 py-4 custom-scrollbar border-t border-zinc-800/50">
+        {selectedPlatform === 'ios' ? (
+          // iOS 平台：使用 Console 风格过滤器（内部布局已适配侧边栏 288px 宽度）
+          iosFilters && onIosFilterChange ? (
+            <IosLogFilterBar
+              state={iosFilters}
+              onChange={onIosFilterChange}
+              theme={theme}
+              totalCount={iosTotalCount}
+              matchedCount={iosMatchedCount}
+            />
+          ) : (
+            <div className={`text-[10px] ${isDark ? 'text-zinc-600' : 'text-slate-400'} text-center py-4`}>
+              未接入 iOS 过滤器 props
+            </div>
+          )
+        ) : (
+        <>
         <div className={`flex items-center gap-2 mb-6 ${isDark ? 'text-zinc-400' : 'text-zinc-500'}`}>
             <Filter size={14} />
             <h2 className="text-[10px] font-bold uppercase tracking-[0.2em]">Live Filters</h2>
@@ -168,7 +195,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="space-y-6">
           <div className="group">
             <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>
-              {selectedPlatform === 'ios' ? 'Log Type' : 'Log Level'}
+              Log Level
             </label>
             <div className="relative">
                 <select
@@ -176,24 +203,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   value={filters.level}
                   onChange={(e) => onFilterChange({ ...filters, level: e.target.value })}
                 >
-                  {selectedPlatform === 'ios' ? (
-                    <>
-                      <option value="V">All Types</option>
-                      <option value="D">Debug</option>
-                      <option value="I">Info</option>
-                      <option value="W">Warning</option>
-                      <option value="E">Error</option>
-                      <option value="F">Fault</option>
-                    </>
-                  ) : (
-                    <>
-                      <option value="V">Verbose</option>
-                      <option value="D">Debug</option>
-                      <option value="I">Info</option>
-                      <option value="W">Warn</option>
-                      <option value="E">Error</option>
-                    </>
-                  )}
+                  <option value="V">Verbose</option>
+                  <option value="D">Debug</option>
+                  <option value="I">Info</option>
+                  <option value="W">Warn</option>
+                  <option value="E">Error</option>
                 </select>
                 <div className={`absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none ${isDark ? 'text-zinc-500' : 'text-slate-400'}`}>
                     <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
@@ -223,14 +237,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
           <div className="group">
             <label className={`block text-[10px] font-bold ${isDark ? 'text-zinc-400' : 'text-zinc-500'} mb-2 group-focus-within:text-blue-500 transition-colors uppercase tracking-widest`}>
-              {selectedPlatform === 'ios' ? 'Process (Regex)' : 'Tag (Regex)'}
+              Tag (Regex)
             </label>
             <div className="relative">
                 <Tag size={12} className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDark ? 'text-zinc-600' : 'text-slate-400'} group-focus-within:text-blue-500 transition-colors`} />
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   className={`w-full ${inputBg} border ${inputBorder} rounded-lg pl-8 pr-3 py-2 text-xs ${inputText} ${inputPlaceholder} focus:outline-none focus:border-blue-500/50 transition-all`}
-                  placeholder={selectedPlatform === 'ios' ? 'e.g. kernel' : 'e.g. ActivityManager'}
+                  placeholder="e.g. ActivityManager"
                   value={filters.tag}
                   onChange={(e) => onFilterChange({...filters, tag: e.target.value})}
                 />
@@ -265,6 +279,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           </div>
         </div>
+        </>
+        )}
       </div>
       
       <div className={`px-4 py-1.5 border-t ${borderColor} text-[10px] ${isDark ? 'text-zinc-600' : 'text-slate-400'} ${bgColor} flex items-center justify-between shrink-0 h-9`}>
